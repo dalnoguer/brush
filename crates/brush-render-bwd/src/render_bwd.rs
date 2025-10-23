@@ -12,9 +12,13 @@ use burn_cubecl::cubecl::server::Bindings;
 use burn_cubecl::kernel::into_contiguous;
 use glam::uvec2;
 
-kernel_source_gen!(ProjectBackwards {}, project_backwards);
+kernel_source_gen!(ProjectBackwards { render_depth }, project_backwards);
 kernel_source_gen!(
-    RasterizeBackwards { hard_float, webgpu },
+    RasterizeBackwards {
+        hard_float,
+        webgpu,
+        render_depth
+    },
     rasterize_backwards
 );
 
@@ -25,6 +29,8 @@ pub struct SplatGrads<B: Backend> {
     pub v_scales: FloatTensor<B>,
     pub v_coeffs: FloatTensor<B>,
     pub v_raw_opac: FloatTensor<B>,
+    pub v_normals: FloatTensor<B>,
+    pub v_plane_distances: FloatTensor<B>,
     pub v_refine_weight: FloatTensor<B>,
 }
 
@@ -43,6 +49,7 @@ pub(crate) fn render_backward(
     global_from_compact_gid: CubeTensor<WgpuRuntime>,
     tile_offsets: CubeTensor<WgpuRuntime>,
     sh_degree: u32,
+    render_depth: bool,
 ) -> SplatGrads<MainBackendBase> {
     // Comes from loss, might not be contiguous.
     let v_output = into_contiguous(v_output);
@@ -60,7 +67,7 @@ pub(crate) fn render_backward(
     let tile_offsets = into_contiguous(tile_offsets);
 
     let device = &out_img.device;
-    let img_dimgs = out_img.shape.dims;
+    let img_dimgs = out_img.clone().shape.dims;
     let img_size = glam::uvec2(img_dimgs[1] as u32, img_dimgs[0] as u32);
 
     let num_points = means.shape.dims[0];
@@ -79,9 +86,100 @@ pub(crate) fn render_backward(
         FloatDType::F32,
     );
     let v_raw_opac = MainBackendBase::float_zeros([num_points].into(), device, FloatDType::F32);
-    let v_grads = MainBackendBase::float_zeros([num_points, 8].into(), device, FloatDType::F32);
+    let v_grads = MainBackendBase::float_zeros([num_points, 12].into(), device, FloatDType::F32);
+    let v_normals = MainBackendBase::float_zeros([num_points, 3].into(), device, FloatDType::F32);
+    let v_plane_distances =
+        MainBackendBase::float_zeros([num_points].into(), device, FloatDType::F32);
     let v_refine_weight =
         MainBackendBase::float_zeros([num_points].into(), device, FloatDType::F32);
+
+    let (out_img, out_normal, _, out_distance) = if render_depth {
+        (
+            MainBackendBase::float_slice(
+                out_img.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (0..4).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                out_img.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (4..8).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                out_img.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (8..9).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                out_img,
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (9..10).into(),
+                ],
+            ),
+        )
+    } else {
+        (
+            out_img,
+            v_normals.clone(),
+            v_plane_distances.clone(),
+            v_plane_distances.clone(),
+        )
+    };
+
+    let (v_out_img, v_out_normal, v_out_depth, _) = if render_depth {
+        (
+            MainBackendBase::float_slice(
+                v_output.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (0..4).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                v_output.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (4..7).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                v_output.clone(),
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (8..9).into(),
+                ],
+            ),
+            MainBackendBase::float_slice(
+                v_output,
+                &[
+                    (0..img_dimgs[0]).into(),
+                    (0..img_dimgs[1]).into(),
+                    (9..10).into(),
+                ],
+            ),
+        )
+    } else {
+        (
+            v_output,
+            v_normals.clone(),
+            v_plane_distances.clone(),
+            v_plane_distances.clone(),
+        )
+    };
 
     let tile_bounds = uvec2(
         img_size
@@ -101,35 +199,42 @@ pub(crate) fn render_backward(
 
     // Use checked execution, as the atomic loops are potentially unbounded.
     tracing::trace_span!("RasterizeBackwards").in_scope(|| {
+        let mut bindings = Bindings::new().with_buffers(vec![
+            uniforms_buffer.handle.clone().binding(),
+            compact_gid_from_isect.handle.binding(),
+            global_from_compact_gid.handle.clone().binding(),
+            tile_offsets.handle.binding(),
+            projected_splats.handle.binding(),
+            out_img.handle.clone().binding(),
+            v_out_img.handle.binding(),
+            v_grads.handle.clone().binding(),
+            v_raw_opac.handle.clone().binding(),
+            v_refine_weight.handle.clone().binding(),
+        ]);
+
+        if render_depth {
+            bindings = bindings.with_buffers(vec![
+                out_normal.handle.clone().binding(),
+                out_distance.handle.clone().binding(),
+                v_out_normal.handle.clone().binding(),
+                v_out_depth.handle.clone().binding()
+            ]);
+        }
+
         // SAFETY: Kernel checked to have no OOB, bounded loops.
         unsafe {
             client.execute_unchecked(
-                RasterizeBackwards::task(hard_floats, webgpu),
+                RasterizeBackwards::task(hard_floats, webgpu, render_depth),
                 CubeCount::Static(tile_bounds.x * tile_bounds.y, 1, 1),
-                Bindings::new().with_buffers(vec![
-                    uniforms_buffer.handle.clone().binding(),
-                    compact_gid_from_isect.handle.binding(),
-                    global_from_compact_gid.handle.clone().binding(),
-                    tile_offsets.handle.binding(),
-                    projected_splats.handle.binding(),
-                    out_img.handle.binding(),
-                    v_output.handle.binding(),
-                    v_grads.handle.clone().binding(),
-                    v_raw_opac.handle.clone().binding(),
-                    v_refine_weight.handle.clone().binding(),
-                ]),
+                bindings,
             );
         }
     });
 
-    tracing::trace_span!("ProjectBackwards").in_scope(||
+    tracing::trace_span!("ProjectBackwards").in_scope(|| {
         // SAFETY: Kernel has to contain no OOB indexing, bounded loops.
         unsafe {
-        client.execute_unchecked(
-            ProjectBackwards::task(),
-            calc_cube_count([num_points as u32], ProjectBackwards::WORKGROUP_SIZE),
-            Bindings::new().with_buffers(
-            vec![
+            let mut bindings = Bindings::new().with_buffers(vec![
                 uniforms_buffer.handle.binding(),
                 means.handle.binding(),
                 log_scales.handle.binding(),
@@ -139,9 +244,22 @@ pub(crate) fn render_backward(
                 v_means.handle.clone().binding(),
                 v_scales.handle.clone().binding(),
                 v_quats.handle.clone().binding(),
-                v_coeffs.handle.clone().binding()
-            ]),
-        );
+                v_coeffs.handle.clone().binding(),
+            ]);
+
+            if render_depth {
+                bindings = bindings.with_buffers(vec![
+                    v_normals.handle.clone().binding(),
+                    v_plane_distances.handle.clone().binding(),
+                ]);
+            }
+
+            client.execute_unchecked(
+                ProjectBackwards::task(render_depth),
+                calc_cube_count([num_points as u32], ProjectBackwards::WORKGROUP_SIZE),
+                bindings,
+            );
+        }
     });
 
     assert!(v_means.is_contiguous(), "Grads must be contiguous");
@@ -157,6 +275,8 @@ pub(crate) fn render_backward(
         v_scales,
         v_coeffs,
         v_raw_opac,
+        v_normals,
+        v_plane_distances,
         v_refine_weight,
     }
 }

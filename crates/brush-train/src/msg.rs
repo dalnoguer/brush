@@ -16,6 +16,8 @@ pub struct TrainStepStats<B: Backend> {
     pub num_intersections: Tensor<B, 1, Int>,
     pub num_visible: Tensor<B, 1, Int>,
     pub loss: Tensor<B, 1>,
+    pub scale_loss: Tensor<B, 1>,
+    pub sv_loss: Tensor<B, 1>,
 
     pub lr_mean: f64,
     pub lr_rotation: f64,

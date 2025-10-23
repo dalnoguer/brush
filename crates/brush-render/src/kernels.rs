@@ -7,4 +7,4 @@ kernel_source_gen!(
     MapGaussiansToIntersect { prepass },
     map_gaussian_to_intersects
 );
-kernel_source_gen!(Rasterize { bwd_info, webgpu }, rasterize);
+kernel_source_gen!(Rasterize { render_depth, bwd_info, webgpu }, rasterize);

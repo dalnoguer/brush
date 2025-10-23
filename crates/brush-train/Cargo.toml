@@ -9,6 +9,7 @@ license.workspace = true
 brush-render.path = "../brush-render"
 brush-dataset.path = "../brush-dataset"
 brush-render-bwd.path = "../brush-render-bwd"
+brush-georeg.path = "../brush-georeg"
 
 anyhow.workspace = true
 image.workspace = true

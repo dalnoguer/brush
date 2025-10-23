@@ -124,6 +124,7 @@ async fn test_reference() -> Result<()> {
             glam::vec2(0.5, 0.5),
         );
 
+        let (normals, plane_distances) = splats.local_normals_and_plane_distances(&cam);
         let diff_out = DiffBack::render_splats(
             &cam,
             glam::uvec2(w as u32, h as u32),
@@ -132,7 +133,10 @@ async fn test_reference() -> Result<()> {
             splats.rotation.val().into_primitive().tensor(),
             splats.sh_coeffs.val().into_primitive().tensor(),
             splats.raw_opacity.val().into_primitive().tensor(),
+            normals.into_primitive().tensor(),
+            plane_distances.into_primitive().tensor(),
             Vec3::ZERO,
+            true,
         );
 
         let (out, aux) = (

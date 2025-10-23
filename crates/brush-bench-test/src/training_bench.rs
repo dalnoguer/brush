@@ -162,7 +162,7 @@ mod forward_rendering {
 
         bencher.bench_local(move || {
             for _ in 0..ITERS_PER_SYNC {
-                let _ = splats.render(&camera, glam::uvec2(1920, 1080), Vec3::ZERO, None);
+                let _ = splats.render(&camera, glam::uvec2(1920, 1080), Vec3::ZERO, None, true);
             }
             MainBackend::sync(&device);
         });
@@ -182,7 +182,7 @@ mod forward_rendering {
 
         bencher.bench_local(move || {
             for _ in 0..ITERS_PER_SYNC {
-                let _ = splats.render(&camera, glam::uvec2(width, height), Vec3::ZERO, None);
+                let _ = splats.render(&camera, glam::uvec2(width, height), Vec3::ZERO, None, true);
             }
             MainBackend::sync(&device);
         });
@@ -210,6 +210,7 @@ mod backward_rendering {
 
         bencher.bench_local(move || {
             for _ in 0..ITERS_PER_SYNC {
+                let (normals, plane_distances) = splats.local_normals_and_plane_distances(&camera);
                 let diff_out = DiffBackend::render_splats(
                     &camera,
                     glam::uvec2(1920, 1080),
@@ -218,7 +219,10 @@ mod backward_rendering {
                     splats.rotation.val().into_primitive().tensor(),
                     splats.sh_coeffs.val().into_primitive().tensor(),
                     splats.raw_opacity.val().into_primitive().tensor(),
+                    normals.into_primitive().tensor(),
+                    plane_distances.into_primitive().tensor(),
                     Vec3::ZERO,
+                    true,
                 );
                 let img: Tensor<DiffBackend, 3> =
                     Tensor::from_primitive(TensorPrimitive::Float(diff_out.img));
@@ -241,6 +245,7 @@ mod backward_rendering {
         );
         bencher.bench_local(move || {
             for _ in 0..ITERS_PER_SYNC {
+                let (normals, plane_distances) = splats.local_normals_and_plane_distances(&camera);
                 let diff_out = DiffBackend::render_splats(
                     &camera,
                     glam::uvec2(width, height),
@@ -249,7 +254,10 @@ mod backward_rendering {
                     splats.rotation.val().into_primitive().tensor(),
                     splats.sh_coeffs.val().into_primitive().tensor(),
                     splats.raw_opacity.val().into_primitive().tensor(),
+                    normals.into_primitive().tensor(),
+                    plane_distances.into_primitive().tensor(),
                     Vec3::ZERO,
+                    true,
                 );
                 let img: Tensor<DiffBackend, 3> =
                     Tensor::from_primitive(TensorPrimitive::Float(diff_out.img));

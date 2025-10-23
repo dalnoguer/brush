@@ -22,6 +22,15 @@ use crate::{
     ui_process::UiProcess, widget_3d::Widget3D,
 };
 
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum RenderMode {
+    #[default]
+    Rgb,
+    Normal,
+    Depth,
+    Distance,
+}
+
 #[derive(Clone, PartialEq)]
 struct RenderState {
     size: UVec2,
@@ -29,6 +38,7 @@ struct RenderState {
     frame: f32,
     settings: CameraSettings,
     grid_opacity: f32,
+    render_mode: RenderMode,
 }
 
 struct ErrorDisplay {
@@ -100,6 +110,7 @@ pub struct ScenePanel {
     frame: f32,
 
     // Ui state.
+    render_mode: RenderMode,
     live_update: bool,
     paused: bool,
     err: Option<ErrorDisplay>,
@@ -134,6 +145,7 @@ impl ScenePanel {
             err: None,
             warnings: vec![],
             view_splats: vec![],
+            render_mode: RenderMode::default(),
             live_update: true,
             paused: false,
             last_state: None,
@@ -194,6 +206,7 @@ impl ScenePanel {
             frame: self.frame,
             settings: settings.clone(),
             grid_opacity,
+            render_mode: self.render_mode,
         };
 
         let dirty = self.last_state != Some(state.clone());
@@ -213,14 +226,26 @@ impl ScenePanel {
             if pixel_size.x > 8 && pixel_size.y > 8 && dirty {
                 let _span = trace_span!("Render splats").entered();
                 // Could add an option for background color.
+                let render_depth = matches!(
+                    self.render_mode,
+                    RenderMode::Normal | RenderMode::Depth | RenderMode::Distance
+                );
                 let (img, _) = splats.render(
                     &camera,
                     pixel_size,
                     settings.background.unwrap_or(Vec3::ZERO),
                     settings.splat_scale,
+                    render_depth,
                 );
 
-                self.backbuffer.update_texture(img);
+                let [h, w, _] = img.dims();
+                let visualization_tensor = match self.render_mode {
+                    RenderMode::Rgb => img.slice([0..h, 0..w, 0..1]),
+                    RenderMode::Normal => img.slice([0..h, 0..w, 1..2]),
+                    RenderMode::Depth => img.slice([0..h, 0..w, 2..3]),
+                    RenderMode::Distance => img.slice([0..h, 0..w, 3..4]),
+                };
+                self.backbuffer.update_texture(visualization_tensor);
 
                 if let Some(widget_3d) = &mut self.widget_3d
                     && let Some(texture) = self.backbuffer.texture()
@@ -424,6 +449,17 @@ impl ScenePanel {
                         settings.splat_scale = Some(scale);
                         process.set_cam_settings(&settings);
                     }
+
+                    ui.add_space(4.0);
+
+                    // Render mode selector
+                    ui.label(egui::RichText::new("Render Mode").size(12.0));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.render_mode, RenderMode::Rgb, "RGB");
+                        ui.selectable_value(&mut self.render_mode, RenderMode::Normal, "Normal");
+                        ui.selectable_value(&mut self.render_mode, RenderMode::Depth, "Depth");
+                        ui.selectable_value(&mut self.render_mode, RenderMode::Distance, "Distance");
+                    });
 
                     ui.add_space(4.0);
 

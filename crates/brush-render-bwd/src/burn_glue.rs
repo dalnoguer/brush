@@ -49,7 +49,10 @@ pub trait SplatForwardDiff<B: Backend> {
         quats: FloatTensor<B>,
         sh_coeffs: FloatTensor<B>,
         raw_opacity: FloatTensor<B>,
+        normals: FloatTensor<B>,
+        plane_distances: FloatTensor<B>,
         background: Vec3,
+        render_depth: bool,
     ) -> SplatOutputDiff<B>;
 }
 
@@ -81,6 +84,7 @@ impl SplatBackwardOps<Self> for MainBackendBase {
             state.global_from_compact_gid,
             state.tile_offsets,
             state.sh_degree,
+            state.render_depth,
         )
     }
 }
@@ -98,12 +102,13 @@ pub struct GaussianBackwardState<B: Backend> {
     global_from_compact_gid: IntTensor<B>,
     tile_offsets: IntTensor<B>,
     sh_degree: u32,
+    render_depth: bool,
 }
 
 #[derive(Debug)]
 struct RenderBackwards;
 
-const NUM_BWD_ARGS: usize = 6;
+const NUM_BWD_ARGS: usize = 8;
 
 // Implement gradient registration when rendering backwards.
 impl<B: Backend + SplatBackwardOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackwards {
@@ -130,6 +135,8 @@ impl<B: Backend + SplatBackwardOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackw
             quats_parent,
             coeffs_parent,
             raw_opacity_parent,
+            normals_parent,
+            plane_distances_parent,
         ] = ops.parents;
 
         let v_tens = B::render_splats_bwd(state, v_output);
@@ -158,6 +165,14 @@ impl<B: Backend + SplatBackwardOps<B>> Backward<B, NUM_BWD_ARGS> for RenderBackw
         if let Some(node) = raw_opacity_parent {
             grads.register::<B>(node.id, v_tens.v_raw_opac);
         }
+
+        if let Some(node) = normals_parent {
+            grads.register::<B>(node.id, v_tens.v_normals);
+        }
+
+        if let Some(node) = plane_distances_parent {
+            grads.register::<B>(node.id, v_tens.v_plane_distances);
+        }
     }
 }
 
@@ -179,7 +194,10 @@ impl<B: Backend + SplatBackwardOps<B> + SplatForward<B>, C: CheckpointStrategy>
         quats: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         raw_opacity: FloatTensor<Self>,
+        normals: FloatTensor<Self>,
+        plane_distances: FloatTensor<Self>,
         background: Vec3,
+        render_depth: bool,
     ) -> SplatOutputDiff<Self> {
         // Get backend tensors & dequantize if needed. Could try and support quantized inputs
         // in the future.
@@ -196,6 +214,8 @@ impl<B: Backend + SplatBackwardOps<B> + SplatForward<B>, C: CheckpointStrategy>
                 quats.node.clone(),
                 sh_coeffs.node.clone(),
                 raw_opacity.node.clone(),
+                normals.node.clone(),
+                plane_distances.node.clone(),
             ])
             .compute_bound()
             .stateful();
@@ -209,8 +229,11 @@ impl<B: Backend + SplatBackwardOps<B> + SplatForward<B>, C: CheckpointStrategy>
             quats.clone().into_primitive(),
             sh_coeffs.clone().into_primitive(),
             raw_opacity.clone().into_primitive(),
+            normals.into_primitive(),
+            plane_distances.into_primitive(),
             background,
             true,
+            render_depth,
         );
 
         let wrapped_aux = RenderAux::<Self> {
@@ -242,6 +265,7 @@ impl<B: Backend + SplatBackwardOps<B> + SplatForward<B>, C: CheckpointStrategy>
                     tile_offsets: aux.tile_offsets,
                     compact_gid_from_isect: aux.compact_gid_from_isect,
                     global_from_compact_gid: aux.global_from_compact_gid,
+                    render_depth: render_depth,
                 };
 
                 let out_img = prep.finish(state, out_img);
@@ -295,7 +319,16 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
                         compact_gid_from_isect,
                         global_from_compact_gid,
                     ],
-                    [v_means, v_quats, v_scales, v_coeffs, v_raw_opac, v_refine],
+                    [
+                        v_means,
+                        v_quats,
+                        v_scales,
+                        v_coeffs,
+                        v_raw_opac,
+                        v_normals,
+                        v_plane_distances,
+                        v_refine,
+                    ],
                 ) = self.desc.as_fixed();
 
                 let inner_state = GaussianBackwardState {
@@ -312,6 +345,7 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
                     global_from_compact_gid: h
                         .get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                     sh_degree: self.sh_degree,
+                    render_depth: true,
                 };
 
                 let grads =
@@ -326,6 +360,8 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
                 h.register_float_tensor::<MainBackendBase>(&v_scales.id, grads.v_scales);
                 h.register_float_tensor::<MainBackendBase>(&v_coeffs.id, grads.v_coeffs);
                 h.register_float_tensor::<MainBackendBase>(&v_raw_opac.id, grads.v_raw_opac);
+                h.register_float_tensor::<MainBackendBase>(&v_normals.id, grads.v_normals);
+                h.register_float_tensor::<MainBackendBase>(&v_plane_distances.id, grads.v_plane_distances);
                 h.register_float_tensor::<MainBackendBase>(&v_refine.id, grads.v_refine_weight);
             }
         }
@@ -340,6 +376,8 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
             v_quats: client.tensor_uninitialized(vec![num_points, 4], DType::F32),
             v_coeffs: client.tensor_uninitialized(vec![num_points, coeffs, 3], DType::F32),
             v_raw_opac: client.tensor_uninitialized(vec![num_points], DType::F32),
+            v_normals: client.tensor_uninitialized(vec![num_points, 3], DType::F32),
+            v_plane_distances: client.tensor_uninitialized(vec![num_points], DType::F32),
             v_refine_weight: client.tensor_uninitialized(vec![num_points], DType::F32),
         };
 
@@ -363,6 +401,8 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
             &grads.v_scales,
             &grads.v_coeffs,
             &grads.v_raw_opac,
+            &grads.v_normals,
+            &grads.v_plane_distances,
             &grads.v_refine_weight,
         ];
 

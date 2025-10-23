@@ -74,10 +74,14 @@ struct ProjectedSplat {
     color_g: f32,
     color_b: f32,
     color_a: f32,
+    normal_x: f32,
+    normal_y: f32,
+    normal_z: f32,
+    plane_distance: f32,
 }
 
-fn create_projected_splat(xy: vec2f, conic: vec3f, color: vec4f) -> ProjectedSplat {
-    return ProjectedSplat(xy.x, xy.y, conic.x, conic.y, conic.z, color.r, color.g, color.b, color.a);
+fn create_projected_splat(xy: vec2f, conic: vec3f, color: vec4f, normal: vec3f, plane_distance: f32) -> ProjectedSplat {
+    return ProjectedSplat(xy.x, xy.y, conic.x, conic.y, conic.z, color.r, color.g, color.b, color.a, normal.x, normal.y, normal.z, plane_distance);
 }
 
 struct PackedVec3 {
@@ -278,4 +282,12 @@ fn as_vec(packed: PackedVec3) -> vec3f {
 
 fn as_packed(vec: vec3f) -> PackedVec3 {
     return PackedVec3(vec.x, vec.y, vec.z);
+}
+
+fn jet_colormap(v: f32) -> vec3f {
+    let v_c = clamp(v, 0.0, 1.0);
+    let r = clamp(1.5 - abs(4.0 * (v_c - 0.75)), 0.0, 1.0);
+    let g = clamp(1.5 - abs(4.0 * (v_c - 0.5)), 0.0, 1.0);
+    let b = clamp(1.5 - abs(4.0 * (v_c - 0.25)), 0.0, 1.0);
+    return vec3f(r, g, b);
 }

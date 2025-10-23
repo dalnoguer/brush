@@ -139,6 +139,7 @@ pub struct SceneView {
 #[derive(Clone)]
 pub struct Scene {
     pub views: Arc<Vec<SceneView>>,
+    pub nearest_neighbors: Arc<Vec<Vec<usize>>>,
 }
 
 fn camera_distance_penalty(cam_local_to_world: Affine3A, reference: Affine3A) -> f32 {
@@ -158,6 +159,7 @@ impl Scene {
     pub fn new(views: Vec<SceneView>) -> Self {
         Self {
             views: Arc::new(views),
+            nearest_neighbors: Arc::new(vec![]),
         }
     }
 
@@ -186,6 +188,88 @@ impl Scene {
             })
             .map(|(index, _)| index) // We return the index instead of the camera
     }
+
+    /// Computes nearest neighbors for each view in the scene and returns a new `Scene`
+    /// with the neighbor information.
+    pub fn with_nearest_neighbors(
+        &self,
+    ) -> Self {
+        let (max_angle_deg, min_dist, max_dist, max_neighbors) =  (30.0, 0.01, 10.0, 8);
+        let neighbors = compute_nearest_neighbors(
+            &self.views,
+            max_angle_deg,
+            min_dist,
+            max_dist,
+            max_neighbors,
+        );
+        Self {
+            views: self.views.clone(),
+            nearest_neighbors: Arc::new(neighbors),
+        }
+    }
+}
+
+fn compute_nearest_neighbors(
+    views: &[SceneView],
+    max_angle_deg: f32,
+    min_dist: f32,
+    max_dist: f32,
+    max_neighbors: usize,
+) -> Vec<Vec<usize>> {
+    let num_cameras = views.len();
+    if num_cameras == 0 {
+        return vec![];
+    }
+
+    let camera_centers: Vec<Vec3> = views.iter().map(|v| v.camera.position).collect();
+    let forward_vectors: Vec<Vec3> = views
+        .iter()
+        .map(|v| v.camera.local_to_world().transform_vector3(Vec3::Z))
+        .collect();
+
+    let mut all_neighbors = Vec::with_capacity(num_cameras);
+
+    for i in 0..num_cameras {
+        let mut candidates = Vec::new();
+
+        for j in 0..num_cameras {
+            if i == j {
+                continue;
+            }
+
+            let dist = camera_centers[i].distance(camera_centers[j]);
+
+            if dist < min_dist || dist > max_dist {
+                continue;
+            }
+
+            let dot = forward_vectors[i].dot(forward_vectors[j]).clamp(-1.0, 1.0);
+            let angle_rad = dot.acos();
+            let angle_deg = angle_rad.to_degrees();
+
+            if angle_deg > max_angle_deg {
+                continue;
+            }
+
+            candidates.push((j, dist, angle_deg));
+        }
+
+        // Sort by distance, then by angle.
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        let neighbors = candidates
+            .into_iter()
+            .map(|(idx, _, _)| idx)
+            .take(max_neighbors)
+            .collect();
+        all_neighbors.push(neighbors);
+    }
+
+    all_neighbors
 }
 
 // Converts an image to a train sample. The tensor will be a floating point image with a [0, 1] image.

@@ -1,0 +1,19 @@
+[package]
+name = "brush-dataset-debug"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+burn = { workspace = true }
+burn-wgpu = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+glam = { workspace = true }
+image = { workspace = true }
+anyhow = { workspace = true }
+brush-render.path = "../brush-render"
+brush-render-bwd.path = "../brush-render-bwd"
+brush-serde.path = "../brush-serde"
+brush-dataset.path = "../brush-dataset"
+brush-vfs.path = "../brush-vfs"
+bytemuck.workspace = true

@@ -53,6 +53,13 @@
     }
 #endif
 
+#ifdef RENDER_DEPTH
+    @group(0) @binding(10) var<storage, read> out_normal: array<vec4f>;
+    @group(0) @binding(11) var<storage, read> out_distance: array<f32>;
+    @group(0) @binding(12) var<storage, read> v_out_normal: array<helpers::PackedVec3>;
+    @group(0) @binding(13) var<storage, read> v_out_depth: array<f32>;
+#endif
+
 const THREAD_COUNT: u32 = 64u;
 const PIXELS_PER_THREAD: u32 = 4u;
 var<workgroup> local_batch: array<helpers::ProjectedSplat, THREAD_COUNT>;
@@ -75,6 +82,14 @@ fn main(
     var v_outs = array<vec4f, PIXELS_PER_THREAD>();
     var pix_outs = array<vec4f, PIXELS_PER_THREAD>();
     var dones = array<bool, PIXELS_PER_THREAD>();
+    #ifdef RENDER_DEPTH
+        var normal_outs = array<vec3f, PIXELS_PER_THREAD>();
+        var plane_distance_outs = array<f32, PIXELS_PER_THREAD>();
+        var v_normal_outs = array<vec3f, PIXELS_PER_THREAD>();
+        var v_plane_distance_outs = array<f32, PIXELS_PER_THREAD>();
+        var final_normals = array<vec3f, PIXELS_PER_THREAD>();
+        var final_distances = array<f32, PIXELS_PER_THREAD>();
+    #endif
     var rgb_pixel_finals = array<vec4f, PIXELS_PER_THREAD>();
 
     for (var i = 0u; i < PIXELS_PER_THREAD; i++) {
@@ -90,6 +105,30 @@ fn main(
             let T_final = 1.0f - final_color.a;
             rgb_pixel_finals[i] = vec4f(final_color.rgb - T_final * uniforms.background.rgb, final_color.a);
             v_outs[i] = vec4f(v_out.rgb, (v_out.a - dot(uniforms.background.rgb, v_out.rgb)) * T_final);
+
+            #ifdef RENDER_DEPTH
+                final_normals[i] = out_normal[pix_id].rgb;
+                final_distances[i] = out_distance[pix_id];
+                let v_out_normal_pix = v_out_normal[pix_id];
+                let v_out_depth_pix = v_out_depth[pix_id];
+
+                let pixel_coord = vec2f(pix_locs[i]) + 0.5f;
+                let ray_dir = vec3f(
+                    (pixel_coord.x - uniforms.pixel_center.x) / uniforms.focal.x,
+                    (pixel_coord.y - uniforms.pixel_center.y) / uniforms.focal.y,
+                    1.0
+                );
+                let denom = dot(final_normals[i], ray_dir) + 1e-8;
+
+                v_plane_distance_outs[i] = -v_out_depth_pix / denom;
+                v_normal_outs[i].x = v_out_normal_pix.x + v_out_depth_pix * final_distances[i] / (denom * denom) * ray_dir.x;
+                v_normal_outs[i].y = v_out_normal_pix.y + v_out_depth_pix * final_distances[i] / (denom * denom) * ray_dir.y;
+                v_normal_outs[i].z = v_out_normal_pix.z + v_out_depth_pix * final_distances[i] / (denom * denom) * ray_dir.z;
+
+                normal_outs[i] = vec3f(0.0);
+                plane_distance_outs[i] = 0.0;
+            #endif
+
             dones[i] = false;
         } else {
             dones[i] = true;
@@ -131,6 +170,10 @@ fn main(
             var v_conic_thread = vec3f(0.0f);
             var v_rgb_thread = vec3f(0.0f);
             var v_alpha_thread = 0.0f;
+            #ifdef RENDER_DEPTH
+                var v_normal_thread = vec3f(0.0f);
+                var v_plane_distance_thread = 0.0f;
+            #endif
             var v_refine_thread = 0.0f;
             var hasGrad = false;
 
@@ -139,6 +182,10 @@ fn main(
             let xy = vec2f(proj.xy_x, proj.xy_y);
             let conic = vec3f(proj.conic_x, proj.conic_y, proj.conic_z);
             let color = vec4f(proj.color_r, proj.color_g, proj.color_b, proj.color_a);
+            #ifdef RENDER_DEPTH
+                let normal = vec3f(proj.normal_x, proj.normal_y, proj.normal_z);
+                let plane_distance = proj.plane_distance;
+            #endif
 
             let clamped_rgb = max(color.rgb, vec3f(0.0f));
 
@@ -167,11 +214,26 @@ fn main(
                 let v_rgb_local = select(vec3f(0.0f), vis * v_outs[i].rgb, color.rgb >= vec3f(0.0f));
                 v_rgb_thread += v_rgb_local;
 
+                #ifdef RENDER_DEPTH
+                    let v_normal_local = vis * v_normal_outs[i];
+                    let v_plane_distance_local = vis * v_plane_distance_outs[i];
+                    v_normal_thread += v_normal_local;
+                    v_plane_distance_thread += v_plane_distance_local;
+                #endif
+
                 // add contribution of this gaussian to the pixel
                 pix_outs[i] = vec4f(pix_outs[i].rgb + vis * clamped_rgb, pix_outs[i].a);
+                #ifdef RENDER_DEPTH
+                    normal_outs[i] += vis * normal;
+                    plane_distance_outs[i] += vis * plane_distance;
+                #endif
 
                 let ra = 1.0f / (1.0f - alpha);
-                let v_alpha = dot(pix_outs[i].a * clamped_rgb + (pix_outs[i].rgb - rgb_pixel_finals[i].rgb) * ra, v_outs[i].rgb) + v_outs[i].a * ra;
+                var v_alpha = dot(pix_outs[i].a * clamped_rgb + (pix_outs[i].rgb - rgb_pixel_finals[i].rgb) * ra, v_outs[i].rgb) + v_outs[i].a * ra;
+                #ifdef RENDER_DEPTH
+                    v_alpha += dot(pix_outs[i].a * normal + (normal_outs[i] - final_normals[i]) * ra, v_normal_outs[i]);
+                    v_alpha += (pix_outs[i].a * plane_distance + (plane_distance_outs[i] - final_distances[i]) * ra) * v_plane_distance_outs[i];
+                #endif
                 let v_sigma = -alpha * v_alpha;
                 let v_xy_local = v_sigma * vec2f(
                     conic.x * delta.x + conic.y * delta.y,
@@ -211,19 +273,29 @@ fn main(
                 let sum_conic = subgroupAdd(v_conic_thread);
                 let sum_rgb = subgroupAdd(v_rgb_thread);
                 let sum_alpha = subgroupAdd(v_alpha_thread);
+                #ifdef RENDER_DEPTH
+                    let sum_normal = subgroupAdd(v_normal_thread);
+                    let sum_plane_distance = subgroupAdd(v_plane_distance_thread);
+                #endif
                 let sum_refine = subgroupAdd(v_refine_thread);
 
                 if doAdd {
                     let global_gid = load_gid[t];
 
-                    write_grads_atomic(global_gid * 8 + 0, sum_xy.x);
-                    write_grads_atomic(global_gid * 8 + 1, sum_xy.y);
-                    write_grads_atomic(global_gid * 8 + 2, sum_conic.x);
-                    write_grads_atomic(global_gid * 8 + 3, sum_conic.y);
-                    write_grads_atomic(global_gid * 8 + 4, sum_conic.z);
-                    write_grads_atomic(global_gid * 8 + 5, sum_rgb.x);
-                    write_grads_atomic(global_gid * 8 + 6, sum_rgb.y);
-                    write_grads_atomic(global_gid * 8 + 7, sum_rgb.z);
+                    write_grads_atomic(global_gid * 12 + 0, sum_xy.x);
+                    write_grads_atomic(global_gid * 12 + 1, sum_xy.y);
+                    write_grads_atomic(global_gid * 12 + 2, sum_conic.x);
+                    write_grads_atomic(global_gid * 12 + 3, sum_conic.y);
+                    write_grads_atomic(global_gid * 12 + 4, sum_conic.z);
+                    write_grads_atomic(global_gid * 12 + 5, sum_rgb.x);
+                    write_grads_atomic(global_gid * 12 + 6, sum_rgb.y);
+                    write_grads_atomic(global_gid * 12 + 7, sum_rgb.z);
+                    #ifdef RENDER_DEPTH
+                        write_grads_atomic(global_gid * 12 + 8, sum_normal.x);
+                        write_grads_atomic(global_gid * 12 + 9, sum_normal.y);
+                        write_grads_atomic(global_gid * 12 + 10, sum_normal.z);
+                        write_grads_atomic(global_gid * 12 + 11, sum_plane_distance);
+                    #endif
                     write_opac_atomic(global_gid, sum_alpha);
                     write_refine_atomic(global_gid, sum_refine);
                 }

@@ -84,6 +84,7 @@ impl SettingsPanel {
                     slider(ui, &mut tc.opac_decay, 0.0..=0.01, "Splat opacity decay", true);
                     slider(ui, &mut tc.scale_decay, 0.0..=0.01, "Splat scale decay", true);
                     slider(ui, &mut tc.match_alpha_weight, 0.01..=1.0, "Alpha match weight", false);
+                    slider(ui, &mut tc.geo_reg_sv_weight, 0.01..=0.1, "GeoReg SV weight", true);
                 });
 
                 ui.add_space(15.0);

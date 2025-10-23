@@ -14,10 +14,12 @@ struct IsectInfo {
 @group(0) @binding(3) var<storage, read> quats: array<vec4f>;
 @group(0) @binding(4) var<storage, read> coeffs: array<helpers::PackedVec3>;
 @group(0) @binding(5) var<storage, read> raw_opacities: array<f32>;
+@group(0) @binding(6) var<storage, read> normals: array<helpers::PackedVec3>;
+@group(0) @binding(7) var<storage, read> plane_distances: array<f32>;
 
-@group(0) @binding(6) var<storage, read> global_from_compact_gid: array<u32>;
+@group(0) @binding(8) var<storage, read> global_from_compact_gid: array<u32>;
 
-@group(0) @binding(7) var<storage, read_write> projected: array<helpers::ProjectedSplat>;
+@group(0) @binding(9) var<storage, read_write> projected: array<helpers::ProjectedSplat>;
 
 struct ShCoeffs {
     b0_c0: vec3f,
@@ -245,6 +247,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     projected[compact_gid] = helpers::create_projected_splat(
         mean2d,
         vec3f(conic[0][0], conic[0][1], conic[1][1]),
-        vec4f(color, opac)
+        vec4f(color, opac),
+        helpers::as_vec(normals[global_gid]),
+        plane_distances[global_gid],
     );
 }

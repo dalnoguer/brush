@@ -63,8 +63,11 @@ pub(crate) fn render_forward(
     quats: CubeTensor<WgpuRuntime>,
     sh_coeffs: CubeTensor<WgpuRuntime>,
     raw_opacities: CubeTensor<WgpuRuntime>,
+    normals: CubeTensor<WgpuRuntime>,
+    plane_distances: CubeTensor<WgpuRuntime>,
     background: Vec3,
     bwd_info: bool,
+    render_depth: bool,
 ) -> (CubeTensor<WgpuRuntime>, RenderAux<MainBackendBase>) {
     assert!(
         img_size[0] > 0 && img_size[1] > 0,
@@ -77,6 +80,8 @@ pub(crate) fn render_forward(
     let quats = into_contiguous(quats);
     let sh_coeffs = into_contiguous(sh_coeffs);
     let raw_opacities = into_contiguous(raw_opacities);
+    let normals = into_contiguous(normals);
+    let plane_distances = into_contiguous(plane_distances);
 
     let device = &means.device.clone();
     let client = means.client.clone();
@@ -89,7 +94,9 @@ pub(crate) fn render_forward(
         .check_dims("log_scales", &log_scales, &["D".into(), 3.into()])
         .check_dims("quats", &quats, &["D".into(), 4.into()])
         .check_dims("sh_coeffs", &sh_coeffs, &["D".into(), "C".into(), 3.into()])
-        .check_dims("raw_opacities", &raw_opacities, &["D".into()]);
+        .check_dims("raw_opacities", &raw_opacities, &["D".into()])
+        .check_dims("normals", &normals, &["D".into(), 3.into()])
+        .check_dims("plane_distances", &plane_distances, &["D".into()]);
 
     // Divide screen into tiles.
     let tile_bounds = calc_tile_bounds(img_size);
@@ -195,6 +202,8 @@ pub(crate) fn render_forward(
                     quats.handle.binding(),
                     sh_coeffs.handle.binding(),
                     raw_opacities.handle.binding(),
+                    normals.handle.binding(),
+                    plane_distances.handle.binding(),
                     global_from_compact_gid.handle.clone().binding(),
                     projected_splats.handle.clone().binding(),
                 ]),
@@ -361,9 +370,41 @@ pub(crate) fn render_forward(
         create_tensor([1], device, DType::F32)
     };
 
+    let (out_normal, out_depth, out_distance) = if render_depth {
+        let out_normal = create_tensor(
+            [img_size.y as usize, img_size.x as usize, out_dim],
+            device,
+            DType::F32,
+        );
+        let out_depth = create_tensor(
+            [img_size.y as usize, img_size.x as usize, 1],
+            device,
+            DType::F32,
+        );
+        let out_distance = create_tensor(
+            [img_size.y as usize, img_size.x as usize, 1],
+            device,
+            DType::F32,
+        );
+
+        bindings = bindings.with_buffers(vec![
+            out_normal.handle.clone().binding(),
+            out_depth.handle.clone().binding(),
+            out_distance.handle.clone().binding(),
+        ]);
+
+        (out_normal, out_depth, out_distance)
+    } else {
+        (
+            create_tensor([1], device, DType::F32),
+            create_tensor([1], device, DType::F32),
+            create_tensor([1], device, DType::F32),
+        )
+    };
+
     // Compile the kernel, including/excluding info for backwards pass.
     // see the BWD_INFO define in the rasterize shader.
-    let raster_task = Rasterize::task(bwd_info, cfg!(target_family = "wasm"));
+    let raster_task = Rasterize::task(render_depth, bwd_info, cfg!(target_family = "wasm"));
 
     // SAFETY: Kernel checked to have no OOB, bounded loops.
     unsafe {
@@ -396,6 +437,20 @@ pub(crate) fn render_forward(
         num_intersections.is_contiguous(),
         "Num intersections must be contiguous"
     );
+
+    let out_img = if render_depth {
+        MainBackendBase::float_cat(
+            vec![
+                out_img,
+                out_normal.clone(),
+                out_depth.clone(),
+                out_distance.clone(),
+            ],
+            2,
+        )
+    } else {
+        out_img
+    };
 
     (
         out_img,

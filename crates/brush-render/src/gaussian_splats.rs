@@ -15,7 +15,7 @@ use burn::{
         Tensor, TensorData, TensorPrimitive, activation::sigmoid, backend::AutodiffBackend, s,
     },
 };
-use glam::Vec3;
+use glam::{Vec3, Vec3Swizzles};
 use rand::Rng;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use tracing::trace_span;
@@ -39,6 +39,32 @@ fn norm_vec<B: Backend>(vec: Tensor<B, 2>) -> Tensor<B, 2> {
     let magnitudes =
         Tensor::clamp_min(Tensor::sum_dim(vec.clone().powi_scalar(2), 1).sqrt(), 1e-32);
     vec / magnitudes
+}
+
+fn qvec_to_rot_mat<B: Backend>(q: Tensor<B, 2>) -> Tensor<B, 3> {
+    // unsqueeze to [N, 1] for broadcasting
+    let r = q.clone().slice(s![.., 0..1]);
+    let x = q.clone().slice(s![.., 1..2]);
+    let y = q.clone().slice(s![.., 2..3]);
+    let z = q.clone().slice(s![.., 3..4]);
+
+    let c00 = (y.clone() * y.clone() + z.clone() * z.clone()) * -2 + 1;
+    let c01 = (x.clone() * y.clone() - r.clone() * z.clone()) * 2;
+    let c02 = (x.clone() * z.clone() + r.clone() * y.clone()) * 2;
+
+    let c10 = (x.clone() * y.clone() + r.clone() * z.clone()) * 2;
+    let c11 = (x.clone() * x.clone() + z.clone() * z.clone()) * -2 + 1;
+    let c12 = (y.clone() * z.clone() - r.clone() * x.clone()) * 2;
+
+    let c20 = (x.clone() * z.clone() - r.clone() * y.clone()) * 2;
+    let c21 = (y.clone() * z + r * x.clone()) * 2;
+    let c22 = (x.clone() * x + y.clone() * y.clone()) * -2 + 1;
+
+    let row0 = Tensor::cat(vec![c00, c01, c02], 1).unsqueeze_dim(1);
+    let row1 = Tensor::cat(vec![c10, c11, c12], 1).unsqueeze_dim(1);
+    let row2 = Tensor::cat(vec![c20, c21, c22], 1).unsqueeze_dim(1);
+
+    Tensor::cat(vec![row0, row1, row2], 1)
 }
 
 pub fn inverse_sigmoid(x: f32) -> f32 {
@@ -280,12 +306,12 @@ impl<B: Backend> Splats<B> {
         validate_tensor_val(
             &self.log_scales.val(),
             "log_scales",
-            Some(-10.0),
+            None,
             Some(10.0),
         );
 
         let scales = self.scales();
-        validate_tensor_val(&scales, "scales", Some(1e-20), Some(10000.0));
+        validate_tensor_val(&scales, "scales", None, Some(10000.0));
 
         // Validate SH coefficients
         validate_tensor_val(&self.sh_coeffs.val(), "sh_coeffs", Some(-5.0), Some(5.0));
@@ -302,7 +328,7 @@ impl<B: Backend> Splats<B> {
 
         // Range validation if requested
         // Scales should be positive and reasonable
-        validate_tensor_val(&scales, "scales", Some(1e-6), Some(100.0));
+        validate_tensor_val(&scales, "scales", None, Some(100.0));
 
         // Normalized rotations should have unit magnitude (quaternion)
         let rot_norms = rotations.powi_scalar(2).sum_dim(1).sqrt();
@@ -418,6 +444,7 @@ impl<B: Backend + SplatForward<B>> Splats<B> {
         img_size: glam::UVec2,
         background: Vec3,
         splat_scale: Option<f32>,
+        render_depth: bool,
     ) -> (Tensor<B, 3>, RenderAux<B>) {
         let mut scales = self.log_scales.val();
 
@@ -429,6 +456,7 @@ impl<B: Backend + SplatForward<B>> Splats<B> {
             scales = scales + scale.ln();
         };
 
+        let (normals, plane_distances) = self.local_normals_and_plane_distances(camera);
         let (img, aux) = B::render_splats(
             camera,
             img_size,
@@ -437,12 +465,70 @@ impl<B: Backend + SplatForward<B>> Splats<B> {
             self.rotation.val().into_primitive().tensor(),
             self.sh_coeffs.val().into_primitive().tensor(),
             self.raw_opacity.val().into_primitive().tensor(),
+            normals.into_primitive().tensor(),
+            plane_distances.into_primitive().tensor(),
             background,
             false,
+            render_depth,
         );
         let img = Tensor::from_primitive(TensorPrimitive::Float(img));
         #[cfg(any(feature = "debug-validation", test))]
         aux.validate_values();
         (img, aux)
+    }
+}
+
+impl<B: Backend> Splats<B> {
+    /// Returns the normals of the splats in camera coordinates,
+    /// and the distance of the splat plane from the camera origin.
+    pub fn local_normals_and_plane_distances(
+        &self,
+        camera: &Camera,
+    ) -> (Tensor<B, 2>, Tensor<B, 1>) {
+        let device = self.device();
+        let view_matrix = camera.world_to_local();
+
+        let view_rot = Tensor::<B, 2>::from_data(
+            TensorData::new(view_matrix.to_cols_array_2d()[0..3].concat(), [3, 3]),
+            &device,
+        );
+        let view_trans: Tensor<B, 2> =
+            Tensor::<B, 1>::from_floats(view_matrix.w_axis.xyz().to_array(), &device).unsqueeze();
+
+        let xyz_in_cam = self.means.val().matmul(view_rot.clone()).add(view_trans);
+        let local_normals = self.world_normals(camera).matmul(view_rot);
+
+        let plane_distances: Tensor<B, 1> = (local_normals.clone() * xyz_in_cam)
+            .sum_dim(1)
+            .abs()
+            .squeeze();
+
+        (local_normals, plane_distances)
+    }
+
+    /// Returns the normal of the splats in world coordinates, oriented towards the camera.
+    pub fn world_normals(&self, camera: &Camera) -> Tensor<B, 2> {
+        let rotations = self.rotations_normed();
+        let rot_mats = qvec_to_rot_mat(rotations);
+
+        let scales = self.scales();
+        let (_, min_indices) = scales.min_dim_with_indices(1);
+
+        let indices = min_indices.reshape([-1, 1, 1]);
+        let expanded_indices = indices.expand([rot_mats.dims()[0], 3, 1]);
+        let smallest_axis = rot_mats.gather(2, expanded_indices);
+        let mut world_normals: Tensor<B, 2> = smallest_axis.squeeze();
+
+        let cam_pos_arr: [f32; 3] = camera.position.into();
+        let cam_pos = Tensor::<B, 1>::from_floats(cam_pos_arr, &self.device());
+        let view_dirs = cam_pos.unsqueeze() - self.means.val();
+
+        let dot_products = (world_normals.clone() * view_dirs).sum_dim(1);
+        let neg_mask = dot_products.lower_elem(0.0);
+
+        world_normals = world_normals
+            .clone()
+            .mask_where(neg_mask.clone().unsqueeze(), world_normals.neg());
+        world_normals
     }
 }

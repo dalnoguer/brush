@@ -119,7 +119,7 @@ pub(crate) async fn train_stream(
             .next_batch()
             .instrument(trace_span!("Wait for next data batch"))
             .await;
-        let (new_splats, stats) = trainer.step(batch, splats);
+        let (new_splats, stats) = trainer.step(iter, batch, splats);
         splats = new_splats;
         let (new_splats, refine) = trainer
             .refine_if_needed(iter, splats)

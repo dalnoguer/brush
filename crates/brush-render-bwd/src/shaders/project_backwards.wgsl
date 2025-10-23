@@ -16,6 +16,11 @@
 @group(0) @binding(8) var<storage, read_write> v_quats: array<vec4f>;
 @group(0) @binding(9) var<storage, read_write> v_coeffs: array<f32>;
 
+#ifdef RENDER_DEPTH
+    @group(0) @binding(10) var<storage, read_write> v_normals: array<helpers::PackedVec3>;
+    @group(0) @binding(11) var<storage, read_write> v_plane_distances: array<f32>;
+#endif
+
 const SH_C0: f32 = 0.2820947917738781f;
 
 struct ShCoeffs {
@@ -309,12 +314,21 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     // Safe to normalize, quats with norm 0 are invisible.
     let quat = normalize(quat_unorm);
 
-    let grad0 = v_grads[global_gid * 2];
-    let grad1 = v_grads[global_gid * 2 + 1];
+    let grad0 = v_grads[global_gid * 3 + 0];
+    let grad1 = v_grads[global_gid * 3 + 1];
 
     let v_mean2d = vec2f(grad0.x, grad0.y);
     let v_conics = vec3f(grad0.z, grad0.w, grad1.x);
     let v_color = vec3f(grad1.y, grad1.z, grad1.w);
+
+    #ifdef RENDER_DEPTH
+        let grad2 = v_grads[global_gid * 3 + 2];
+        let v_normal = vec3f(grad2.x, grad2.y, grad2.z);
+        let v_plane_distance = grad2.w;
+    #else
+        let v_normal = vec3f(0.0);
+        let v_plane_distance = 0.0;
+    #endif
 
     let viewdir = normalize(mean - uniforms.camera_position.xyz);
 
@@ -428,4 +442,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     v_means[global_gid] = helpers::as_packed(v_mean);
     v_scales[global_gid] = helpers::as_packed(v_scale_exp);
     v_quats[global_gid] = v_quat;
+
+    #ifdef RENDER_DEPTH
+        v_normals[global_gid] = helpers::as_packed(v_normal);
+        v_plane_distances[global_gid] = v_plane_distance;
+    #endif
 }

@@ -9,6 +9,7 @@ use crate::{
 };
 
 use brush_dataset::{config::AlphaMode, scene::SceneBatch};
+use brush_georeg::geometry_regularization::{scale_loss, sv_geometry_regularization_loss};
 use brush_render::{MainBackend, gaussian_splats::Splats};
 use brush_render::{bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
 use brush_render_bwd::burn_glue::SplatForwardDiff;
@@ -96,6 +97,7 @@ impl SplatTrainer {
 
     pub fn step(
         &mut self,
+        iter: u32,
         batch: SceneBatch,
         splats: Splats<DiffBackend>,
     ) -> (Splats<DiffBackend>, TrainStepStats<MainBackend>) {
@@ -111,11 +113,12 @@ impl SplatTrainer {
         let has_alpha = batch.has_alpha();
         let gt_tensor = Tensor::from_data(batch.img_tensor, &device);
 
-        let (pred_image, aux, refine_weight_holder) = trace_span!("Forward").in_scope(|| {
+        let (rendered_image, aux, refine_weight_holder) = trace_span!("Forward").in_scope(|| {
             // Could generate a random background color, but so far
             // results just seem worse.
             let background = Vec3::ZERO;
 
+            let (normals, plane_distances) = splats.local_normals_and_plane_distances(&camera);
             let diff_out = <DiffBackend as SplatForwardDiff<_>>::render_splats(
                 camera,
                 glam::uvec2(img_w as u32, img_h as u32),
@@ -124,7 +127,10 @@ impl SplatTrainer {
                 splats.rotation.val().into_primitive().tensor(),
                 splats.sh_coeffs.val().into_primitive().tensor(),
                 splats.raw_opacity.val().into_primitive().tensor(),
+                normals.into_primitive().tensor(),
+                plane_distances.into_primitive().tensor(),
                 background,
+                true,
             );
 
             let img = Tensor::from_primitive(TensorPrimitive::Float(diff_out.img));
@@ -138,16 +144,18 @@ impl SplatTrainer {
             (img, diff_out.aux, diff_out.refine_weight_holder)
         });
 
+        let pred_image = rendered_image.clone().slice(s![.., .., 0..4]);
+
         let median_scale = self.bounds.median_size();
         let num_visible = aux.num_visible().inner();
         let num_intersections = aux.num_intersections().inner();
-        let pred_rgb = pred_image.clone().slice(s![.., .., 0..3]);
+        let pred_rgb = rendered_image.clone().slice(s![.., .., 0..3]);
         let gt_rgb = gt_tensor.clone().slice(s![.., .., 0..3]);
 
         let visible: Tensor<Autodiff<MainBackend>, 1> =
             Tensor::from_primitive(TensorPrimitive::Float(aux.visible));
 
-        let loss = trace_span!("Calculate losses").in_scope(|| {
+        let (loss, scale_loss, sv_loss) = trace_span!("Calculate losses").in_scope(|| {
             let l1_rgb = (pred_rgb.clone() - gt_rgb.clone()).abs();
 
             let total_err = if let Some(ssim) = &self.ssim {
@@ -175,13 +183,29 @@ impl SplatTrainer {
             // TODO: Support masked lpips.
             #[cfg(not(target_family = "wasm"))]
             let loss = if let Some(lpips) = &self.lpips {
-                loss + lpips.lpips(pred_rgb.unsqueeze_dim(0), gt_rgb.unsqueeze_dim(0))
+                loss + lpips.lpips(pred_rgb.unsqueeze_dim(0), gt_rgb.clone().unsqueeze_dim(0))
                     * self.config.lpips_loss_weight
             } else {
                 loss
             };
 
-            loss
+            let scale_loss = scale_loss(&splats.scales(), &visible);
+            let loss = loss + self.config.geo_reg_scale_weight * scale_loss.clone();
+
+            let (loss, sv_loss) = if iter > self.config.geo_reg_iter {
+                let sv_loss = sv_geometry_regularization_loss(
+                    &rendered_image,
+                    &camera,
+                    glam::uvec2(img_w as u32, img_h as u32),
+                    &gt_rgb,
+                );
+
+                (loss + self.config.geo_reg_sv_weight * sv_loss.clone(), sv_loss)
+            } else {
+                (loss, Tensor::zeros([1], &device))
+            };
+
+            (loss, scale_loss, sv_loss)
         });
 
         let mut grads = trace_span!("Backward pass").in_scope(|| loss.backward());
@@ -290,6 +314,8 @@ impl SplatTrainer {
             pred_image: pred_image.inner(),
             num_visible,
             num_intersections,
+            scale_loss: scale_loss.inner(),
+            sv_loss: sv_loss.inner(),
             loss: loss.inner(),
             lr_mean,
             lr_rotation,

@@ -27,6 +27,8 @@ fn renders_at_all() {
             .repeat_dim(0, num_points);
     let sh_coeffs = Tensor::<MainBackend, 3>::ones([num_points, 1, 3], &device);
     let raw_opacity = Tensor::<MainBackend, 1>::zeros([num_points], &device);
+    let normals = Tensor::<MainBackend, 2>::zeros([num_points, 3], &device);
+    let plane_distances = Tensor::<MainBackend, 1>::zeros([num_points], &device);
     let (output, aux) = <MainBackend as SplatForward<MainBackend>>::render_splats(
         &cam,
         img_size,
@@ -35,7 +37,10 @@ fn renders_at_all() {
         quats.into_primitive().tensor(),
         sh_coeffs.into_primitive().tensor(),
         raw_opacity.into_primitive().tensor(),
+        normals.into_primitive().tensor(),
+        plane_distances.into_primitive().tensor(),
         Vec3::ZERO,
+        true,
         true,
     );
     aux.validate_values();

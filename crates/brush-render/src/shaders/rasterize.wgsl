@@ -9,8 +9,18 @@
     @group(0) @binding(4) var<storage, read_write> out_img: array<vec4f>;
     @group(0) @binding(5) var<storage, read> global_from_compact_gid: array<u32>;
     @group(0) @binding(6) var<storage, read_write> visible: array<f32>;
+    #ifdef RENDER_DEPTH
+        @group(0) @binding(7) var<storage, read_write> out_normal: array<vec4f>;
+        @group(0) @binding(8) var<storage, read_write> out_depth: array<f32>;
+        @group(0) @binding(9) var<storage, read_write> out_distance: array<f32>;
+    #endif
 #else
     @group(0) @binding(4) var<storage, read_write> out_img: array<u32>;
+    #ifdef RENDER_DEPTH
+        @group(0) @binding(5) var<storage, read_write> out_normal: array<u32>;
+        @group(0) @binding(6) var<storage, read_write> out_depth: array<u32>;
+        @group(0) @binding(7) var<storage, read_write> out_distance: array<u32>;
+    #endif
 #endif
 
 var<workgroup> range_uniform: vec2u;
@@ -51,6 +61,11 @@ fn main(
     // current visibility left to render
     var T = 1.0;
     var pix_out = vec3f(0.0);
+    #ifdef RENDER_DEPTH
+        var normal_out = vec3f(0.0);
+        var plane_distance_out = 0.0;
+    #endif
+
     var done = !inside;
 
     // each thread loads one gaussian at a time before rasterizing its
@@ -97,6 +112,12 @@ fn main(
 
                 let vis = alpha * T;
                 pix_out += max(color.rgb, vec3f(0.0)) * vis;
+
+                #ifdef RENDER_DEPTH
+                    let normal = vec3f(proj.normal_x, proj.normal_y, proj.normal_z);
+                    normal_out += normal * vis;
+                    plane_distance_out += proj.plane_distance * vis;
+                #endif
                 T = next_T;
             }
         }
@@ -113,6 +134,37 @@ fn main(
             let colors_u = vec4u(clamp(final_color * 255.0, vec4f(0.0), vec4f(255.0)));
             let packed: u32 = colors_u.x | (colors_u.y << 8u) | (colors_u.z << 16u) | (colors_u.w << 24u);
             out_img[pix_id] = packed;
+        #endif
+
+        #ifdef RENDER_DEPTH
+            #ifdef BWD_INFO
+                out_normal[pix_id] = vec4f(normal_out, 1.0 - T);
+            #else
+                let normal_color = vec4f(normal_out * 0.5 + 0.5, 1.0 - T);
+                let normal_u = vec4u(clamp(normal_color * 255.0, vec4f(0.0), vec4f(255.0)));
+                out_normal[pix_id] = normal_u.x | (normal_u.y << 8u) | (normal_u.z << 16u) | (normal_u.w << 24u);
+            #endif
+
+            let ray_dir = vec3f(
+                (pixel_coord.x - uniforms.pixel_center.x) / uniforms.focal.x,
+                (pixel_coord.y - uniforms.pixel_center.y) / uniforms.focal.y,
+                1.0
+            );
+            let final_distance = max(0.0f, plane_distance_out);
+            let final_depth = max(0.0f, plane_distance_out / (dot(normal_out, -ray_dir) + 1e-8));
+            
+            #ifdef BWD_INFO
+                out_distance[pix_id] = final_distance;
+                out_depth[pix_id] = final_depth;
+            #else
+                let depth_color = vec4f(helpers::jet_colormap(final_depth / 5.0), 1.0 - T);
+                let depth_u = vec4u(clamp(depth_color * 255.0, vec4f(0.0), vec4f(255.0)));
+                out_depth[pix_id] = depth_u.x | (depth_u.y << 8u) | (depth_u.z << 16u) | (depth_u.w << 24u);
+
+                let distance_color = vec4f(helpers::jet_colormap(final_distance / 5.0), 1.0 - T);
+                let distance_u = vec4u(clamp(distance_color * 255.0, vec4f(0.0), vec4f(255.0)));
+                out_distance[pix_id] = distance_u.x | (distance_u.y << 8u) | (distance_u.z << 16u) | (distance_u.w << 24u);
+            #endif
         #endif
     }
 }

@@ -279,6 +279,28 @@ mod visualize_tools_impl {
                         stats.loss.clone().into_scalar_async().await.elem::<f64>(),
                     ]),
                 )?;
+                self.rec.log(
+                    "losses/scale_loss",
+                    &rerun::Scalars::new(vec![
+                        stats
+                            .scale_loss
+                            .clone()
+                            .into_scalar_async()
+                            .await
+                            .elem::<f64>(),
+                    ]),
+                )?;
+                self.rec.log(
+                    "losses/sv_loss",
+                    &rerun::Scalars::new(vec![
+                        stats
+                            .sv_loss
+                            .clone()
+                            .into_scalar_async()
+                            .await
+                            .elem::<f64>(),
+                    ]),
+                )?;
             }
 
             Ok(())

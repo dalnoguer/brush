@@ -27,11 +27,25 @@ impl SplatForward<Self> for MainBackendBase {
         quats: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         opacity: FloatTensor<Self>,
+        normals: FloatTensor<Self>,
+        plane_distances: FloatTensor<Self>,
         background: Vec3,
         bwd_info: bool,
+        render_depth: bool,
     ) -> (FloatTensor<Self>, RenderAux<Self>) {
         render_forward(
-            camera, img_size, means, log_scales, quats, sh_coeffs, opacity, background, bwd_info,
+            camera,
+            img_size,
+            means,
+            log_scales,
+            quats,
+            sh_coeffs,
+            opacity,
+            normals,
+            plane_distances,
+            background,
+            bwd_info,
+            render_depth,
         )
     }
 }
@@ -45,14 +59,18 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
         quats: FloatTensor<Self>,
         sh_coeffs: FloatTensor<Self>,
         opacity: FloatTensor<Self>,
+        normals: FloatTensor<Self>,
+        plane_distances: FloatTensor<Self>,
         background: Vec3,
         bwd_info: bool,
+        render_depth: bool,
     ) -> (FloatTensor<Self>, RenderAux<Self>) {
         #[derive(Debug)]
         struct CustomOp {
             cam: Camera,
             img_size: glam::UVec2,
             bwd_info: bool,
+            render_depth: bool,
             background: Vec3,
             desc: CustomOpIr,
         }
@@ -64,7 +82,7 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
             ) {
                 let (inputs, outputs) = self.desc.as_fixed();
 
-                let [means, log_scales, quats, sh_coeffs, opacity] = inputs;
+                let [means, log_scales, quats, sh_coeffs, opacity, normals, plane_distances] = inputs;
                 let [
                     projected_splats,
                     uniforms_buffer,
@@ -84,8 +102,11 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
                     h.get_float_tensor::<MainBackendBase>(quats),
                     h.get_float_tensor::<MainBackendBase>(sh_coeffs),
                     h.get_float_tensor::<MainBackendBase>(opacity),
+                    h.get_float_tensor::<MainBackendBase>(normals),
+                    h.get_float_tensor::<MainBackendBase>(plane_distances),
                     self.background,
                     self.bwd_info,
+                    self.render_depth,
                 );
 
                 // Register output.
@@ -124,7 +145,12 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
 
         // If render_u32_buffer is true, we render a packed buffer of u32 values, otherwise
         // render RGBA f32 values.
-        let channels = if bwd_info { 4 } else { 1 };
+        let channels = match (bwd_info, render_depth) {
+            (true, true) => 10,
+            (true, false) => 4,
+            (false, true) => 4,
+            (false, false) => 1,
+        };
 
         let out_img = client.tensor_uninitialized(
             vec![img_size.y as usize, img_size.x as usize, channels],
@@ -149,7 +175,7 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
         };
 
         let mut stream = OperationStreams::default();
-        let input_tensors = [means, log_scales, quats, sh_coeffs, opacity];
+        let input_tensors = [means, log_scales, quats, sh_coeffs, opacity, normals, plane_distances];
         let output_tensors = [
             &aux.projected_splats,
             &aux.uniforms_buffer,
@@ -172,6 +198,7 @@ impl SplatForward<Self> for Fusion<MainBackendBase> {
             cam: cam.clone(),
             img_size,
             bwd_info,
+            render_depth,
             background,
             desc: desc.clone(),
         };

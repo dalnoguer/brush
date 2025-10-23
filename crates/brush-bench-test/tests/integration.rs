@@ -219,6 +219,7 @@ fn test_gradient_validation() {
     );
     let img_size = glam::uvec2(64, 64);
 
+    let (normals, plane_distances) = splats.local_normals_and_plane_distances(&camera);
     let result = <DiffBackend as SplatForwardDiff<DiffBackend>>::render_splats(
         &camera,
         img_size,
@@ -227,7 +228,10 @@ fn test_gradient_validation() {
         splats.rotation.val().into_primitive().tensor(),
         splats.sh_coeffs.val().into_primitive().tensor(),
         splats.raw_opacity.val().into_primitive().tensor(),
+        normals.into_primitive().tensor(),
+        plane_distances.into_primitive().tensor(),
         Vec3::ZERO,
+        true,
     );
 
     let rendered: Tensor<DiffBackend, 3> =

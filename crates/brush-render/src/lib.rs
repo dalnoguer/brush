@@ -61,8 +61,11 @@ pub trait SplatForward<B: Backend> {
         quats: FloatTensor<B>,
         sh_coeffs: FloatTensor<B>,
         raw_opacities: FloatTensor<B>,
+        normals: FloatTensor<B>,
+        plane_distance: FloatTensor<B>,
         background: Vec3,
         bwd_info: bool,
+        render_depth: bool
     ) -> (FloatTensor<B>, RenderAux<B>);
 }
 

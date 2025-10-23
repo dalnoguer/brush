@@ -4,7 +4,7 @@ use serde::Deserialize;
 #[derive(Clone, Parser, Deserialize)]
 pub struct TrainConfig {
     /// Total number of steps to train for.
-    #[arg(long, help_heading = "Training options", default_value = "30000")]
+    #[arg(long, help_heading = "Training options", default_value = "3000")]
     pub total_steps: u32,
 
     /// Max nr. of splats. This is an upper bound, but the actual final number of splats might be lower than this.
@@ -49,7 +49,7 @@ pub struct TrainConfig {
 
     /// Frequency of 'refinement' where gaussians are replaced and densified. This should
     /// roughly be the number of images it takes to properly "cover" your scene.
-    #[arg(long, help_heading = "Refine options", default_value = "200")]
+    #[arg(long, help_heading = "Refine options", default_value = "100")]
     pub refine_every: u32,
 
     /// Threshold to control splat growth. Lower means faster growth.
@@ -62,7 +62,7 @@ pub struct TrainConfig {
     pub growth_select_fraction: f32,
 
     /// Period after which splat growth stops.
-    #[arg(long, help_heading = "Refine options", default_value = "15000")]
+    #[arg(long, help_heading = "Refine options", default_value = "2500")]
     pub growth_stop_iter: u32,
 
     /// Weight of SSIM loss (compared to l1 loss)
@@ -87,6 +87,22 @@ pub struct TrainConfig {
 
     #[arg(long, help_heading = "Refine options", default_value = "0.0")]
     pub lpips_loss_weight: f32,
+
+    /// Enable geometric regularization.
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "true")]
+    pub geo_reg: bool,
+
+    /// Iteration to start applying geometric regularization.
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "1000")]
+    pub geo_reg_iter: u32,
+
+    /// Weight for the scale loss component of geometric regularization.
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "100.0")]
+    pub geo_reg_scale_weight: f32,
+
+    /// Weight for the smoothness (SV) loss component of geometric regularization.
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "0.15")]
+    pub geo_reg_sv_weight: f32,
 }
 
 impl Default for TrainConfig {

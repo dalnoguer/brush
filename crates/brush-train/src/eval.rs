@@ -35,6 +35,7 @@ pub fn eval_stats<B: Backend + SplatForward<B>>(
     let gt_rgb = gt_tensor.slice(s![.., .., 0..3]);
 
     // Render on reference black background.
+    let (normals, plane_distances) = splats.local_normals_and_plane_distances(&gt_cam);
     let (img, aux) = {
         let (img, aux) = B::render_splats(
             gt_cam,
@@ -44,8 +45,11 @@ pub fn eval_stats<B: Backend + SplatForward<B>>(
             splats.rotation.val().into_primitive().tensor(),
             splats.sh_coeffs.val().into_primitive().tensor(),
             splats.raw_opacity.val().into_primitive().tensor(),
+            normals.into_primitive().tensor(),
+            plane_distances.into_primitive().tensor(),
             Vec3::ZERO,
             true,
+            false,
         );
         (Tensor::from_primitive(TensorPrimitive::Float(img)), aux)
     };
