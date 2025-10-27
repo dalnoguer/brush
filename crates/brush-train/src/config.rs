@@ -49,7 +49,7 @@ pub struct TrainConfig {
 
     /// Frequency of 'refinement' where gaussians are replaced and densified. This should
     /// roughly be the number of images it takes to properly "cover" your scene.
-    #[arg(long, help_heading = "Refine options", default_value = "100")]
+    #[arg(long, help_heading = "Refine options", default_value = "50")]
     pub refine_every: u32,
 
     /// Threshold to control splat growth. Lower means faster growth.
@@ -89,7 +89,7 @@ pub struct TrainConfig {
     pub lpips_loss_weight: f32,
 
     /// Enable geometric regularization.
-    #[arg(long, help_heading = "Geometric Regularization", default_value = "true")]
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "false")]
     pub geo_reg: bool,
 
     /// Iteration to start applying geometric regularization.
@@ -101,7 +101,7 @@ pub struct TrainConfig {
     pub geo_reg_scale_weight: f32,
 
     /// Weight for the smoothness (SV) loss component of geometric regularization.
-    #[arg(long, help_heading = "Geometric Regularization", default_value = "0.15")]
+    #[arg(long, help_heading = "Geometric Regularization", default_value = "0.05")]
     pub geo_reg_sv_weight: f32,
 }
 

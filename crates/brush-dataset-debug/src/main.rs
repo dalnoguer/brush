@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let device = WgpuDevice::DefaultDevice;
-    let scene_path = String::from("/Users/daln/results/object_capture/geo_reg_brush/undistorted_arcore_dataset");
+    let scene_path = String::from("/Users/daln/results/object_capture/results/golden_set_vim_vs_colmap/apple_keyboard/undistorted_colmap_dataset");
 
     let source = DataSource::Path(scene_path.clone());
     let vfs = Arc::new(source.into_vfs().await?);

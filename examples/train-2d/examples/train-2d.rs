@@ -61,7 +61,7 @@ fn spawn_train_loop(
         let mut iter = 0;
 
         loop {
-            let (new_splats, _) = trainer.step(batch.clone(), splats);
+            let (new_splats, _) = trainer.step(iter, batch.clone(), splats);
             let (new_splats, _) = trainer.refine_if_needed(iter, new_splats).await;
 
             splats = new_splats;
@@ -172,6 +172,7 @@ impl eframe::App for App {
                 glam::uvec2(self.image.width(), self.image.height()),
                 Vec3::ZERO, // Just render with a black background
                 None,
+                false,
             );
 
             let size = egui::vec2(self.image.width() as f32, self.image.height() as f32);

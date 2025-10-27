@@ -118,6 +118,7 @@ impl SplatTrainer {
             // results just seem worse.
             let background = Vec3::ZERO;
 
+            let render_depth = self.config.geo_reg && iter > self.config.geo_reg_iter;
             let (normals, plane_distances) = splats.local_normals_and_plane_distances(&camera);
             let diff_out = <DiffBackend as SplatForwardDiff<_>>::render_splats(
                 camera,
@@ -130,7 +131,7 @@ impl SplatTrainer {
                 normals.into_primitive().tensor(),
                 plane_distances.into_primitive().tensor(),
                 background,
-                true,
+                render_depth,
             );
 
             let img = Tensor::from_primitive(TensorPrimitive::Float(diff_out.img));
@@ -189,10 +190,15 @@ impl SplatTrainer {
                 loss
             };
 
-            let scale_loss = scale_loss(&splats.scales(), &visible);
-            let loss = loss + self.config.geo_reg_scale_weight * scale_loss.clone();
+            let (loss, scale_loss) = if self.config.geo_reg {
+                let scale_loss = scale_loss(&splats.scales(), &visible);
+                let loss = loss + self.config.geo_reg_scale_weight * scale_loss.clone();
+                (loss, scale_loss)
+            } else {
+                (loss, Tensor::zeros([1], &device))
+            };
 
-            let (loss, sv_loss) = if iter > self.config.geo_reg_iter {
+            let (loss, sv_loss) = if self.config.geo_reg && iter > self.config.geo_reg_iter {
                 let sv_loss = sv_geometry_regularization_loss(
                     &rendered_image,
                     &camera,
@@ -200,7 +206,10 @@ impl SplatTrainer {
                     &gt_rgb,
                 );
 
-                (loss + self.config.geo_reg_sv_weight * sv_loss.clone(), sv_loss)
+                (
+                    loss + self.config.geo_reg_sv_weight * sv_loss.clone(),
+                    sv_loss,
+                )
             } else {
                 (loss, Tensor::zeros([1], &device))
             };

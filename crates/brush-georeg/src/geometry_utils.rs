@@ -9,6 +9,7 @@ use burn::tensor::{backend::Backend, Bool, Tensor};
 /// * `fy` - Focal length y.
 /// * `cx` - Optional principal point x. Defaults to width / 2.0.
 /// * `cy` - Optional principal point y. Defaults to height / 2.0.
+/// * `use_pixel_centers` - Whether to use pixel centers (add 0.5) or corners.
 ///
 /// # Returns
 ///
@@ -19,15 +20,18 @@ pub fn depth_to_point_cloud<B: Backend>(
     fy: f32,
     cx: Option<f32>,
     cy: Option<f32>,
+    use_pixel_centers: bool,
 ) -> Tensor<B, 3> {
     let device = depth.device();
     let [height, width] = depth.dims();
 
     let cx = cx.unwrap_or(width as f32 / 2.0);
     let cy = cy.unwrap_or(height as f32 / 2.0);
+    let offset = if use_pixel_centers { 0.5 } else { 0.0 };
 
-    let x_coords = (Tensor::arange(0..width as i64, &device).float() + 0.5).reshape([1, width]);
-    let y_coords = (Tensor::arange(0..height as i64, &device).float() + 0.5).reshape([height, 1]);
+    let x_coords = (Tensor::arange(0..width as i64, &device).float() + offset).reshape([1, width]);
+    let y_coords =
+        (Tensor::arange(0..height as i64, &device).float() + offset).reshape([height, 1]);
 
     let x = (x_coords - cx) / fx;
     let y = (y_coords - cy) / fy;
@@ -92,6 +96,7 @@ pub fn normal_from_grid_point_cloud<B: Backend>(xyz: Tensor<B, 3>) -> Tensor<B, 
 /// * `fy` - Focal length y.
 /// * `cx` - Optional principal point x. Defaults to width / 2.0.
 /// * `cy` - Optional principal point y. Defaults to height / 2.0.
+/// * `use_pixel_centers` - Whether to use pixel centers (add 0.5) or corners.
 ///
 /// # Returns
 ///
@@ -102,8 +107,9 @@ pub fn compute_normal_from_depth<B: Backend>(
     fy: f32,
     cx: Option<f32>,
     cy: Option<f32>,
+    use_pixel_centers: bool,
 ) -> Tensor<B, 3> {
-    let xyz_cam = depth_to_point_cloud(depth, fx, fy, cx, cy);
+    let xyz_cam = depth_to_point_cloud(depth, fx, fy, cx, cy, use_pixel_centers);
     normal_from_grid_point_cloud(xyz_cam)
 }
 
@@ -329,6 +335,7 @@ pub fn sample_depth_at_coordinates<B: Backend>(
 /// * `p_r` - Tensor of shape (N, 2) containing the reprojected pixel coordinates (u, v).
 /// * `width` - The width of the image.
 /// * `height` - The height of the image.
+/// * `use_pixel_centers` - Whether to use pixel centers (add 0.5) or corners.
 ///
 /// # Returns
 ///
@@ -338,6 +345,7 @@ pub fn compute_pixel_errors<B: Backend>(
     p_r: Tensor<B, 2>,
     width: u32,
     height: u32,
+    use_pixel_centers: bool,
 ) -> Tensor<B, 1> {
     let device = p_r.device();
     let [n, _] = p_r.dims();
@@ -347,12 +355,14 @@ pub fn compute_pixel_errors<B: Backend>(
         "Input p_r must have shape (width * height, 2)"
     );
 
-    let ix: Tensor<B, 3> = (Tensor::arange(0..width as i64, &device).float() + 0.5)
+    let offset = if use_pixel_centers { 0.5 } else { 0.0 };
+
+    let ix: Tensor<B, 3> = (Tensor::arange(0..width as i64, &device).float() + offset)
         .reshape([1, width as usize])
         .repeat_dim(0, height as usize)
         .reshape([height as usize, width as usize, 1]);
 
-    let iy: Tensor<B, 3> = (Tensor::arange(0..height as i64, &device).float() + 0.5)
+    let iy: Tensor<B, 3> = (Tensor::arange(0..height as i64, &device).float() + offset)
         .reshape([height as usize, 1])
         .repeat_dim(1, width as usize)
         .reshape([height as usize, width as usize, 1]);
@@ -360,5 +370,3 @@ pub fn compute_pixel_errors<B: Backend>(
     let p = Tensor::cat(vec![ix, iy], 2).reshape([n, 2]);
     (p_r - p).powi_scalar(2).sum_dim(1).sqrt().squeeze()
 }
-
-

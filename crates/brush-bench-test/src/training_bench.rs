@@ -288,7 +288,7 @@ mod training {
 
             for step in 0..20 {
                 let batch = batches[step % batches.len()].clone();
-                let (new_splats, _) = trainer.step(batch, splats);
+                let (new_splats, _) = trainer.step(step as u32, batch, splats);
                 splats = new_splats;
             }
             MainBackend::sync(&device);

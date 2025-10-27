@@ -298,6 +298,7 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
         struct CustomOp {
             desc: CustomOpIr,
             sh_degree: u32,
+            render_depth: bool,
         }
 
         impl<BT: BoolElement> Operation<FusionCubeRuntime<WgpuRuntime, BT>> for CustomOp {
@@ -345,7 +346,7 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
                     global_from_compact_gid: h
                         .get_int_tensor::<MainBackendBase>(global_from_compact_gid),
                     sh_degree: self.sh_degree,
-                    render_depth: true,
+                    render_depth: self.render_depth,
                 };
 
                 let grads =
@@ -424,6 +425,7 @@ impl SplatBackwardOps<Self> for Fusion<MainBackendBase> {
                 // state,
                 desc,
                 sh_degree: state.sh_degree,
+                render_depth: state.render_depth,
             },
         );
         grads

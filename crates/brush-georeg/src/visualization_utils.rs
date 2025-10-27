@@ -1,6 +1,6 @@
 use anyhow::{Ok, Result};
 use std::{io::Write};
-use burn::tensor::{backend::{AutodiffBackend, Backend}, Tensor};
+use burn::tensor::{backend::{AutodiffBackend, Backend}, Bool, Tensor};
 use image::{DynamicImage, GenericImage, ImageBuffer, Rgba};
 use glam::Vec3;
 use brush_render::camera::Camera;
@@ -197,6 +197,7 @@ pub async fn save_render_output<B: AutodiffBackend>(
     println!("✅ Rendered images for prefix '{}'", prefix);
     Ok(())
 }
+
 async fn save_normal<B: AutodiffBackend>(path: &str, normal: &Tensor<B, 3>) -> Result<()> {
     let [h, w, c] = normal.dims();
     assert!(c == 3, "normal must have 3 channels");
@@ -379,6 +380,35 @@ async fn create_visualization_image<B: AutodiffBackend>(
     composite_image.save("visualization.png")?;
     println!("✅ Saved visualization to visualization.png");
 
+    Ok(())
+}
+
+/// Saves a boolean tensor as a grayscale image.
+///
+/// # Arguments
+///
+/// * `path` - The path to save the image file.
+/// * `mask` - A boolean tensor of shape (H, W). True values will be white, False will be black.
+pub async fn save_mask<B: Backend>(path: &str, mask: &Tensor<B, 2, Bool>) -> Result<()> {
+    let [h, w] = mask.dims();
+
+    // Convert boolean tensor to float tensor (true -> 1.0, false -> 0.0)
+    let float_mask = mask.clone().float();
+
+    let data = float_mask
+        .into_data_async()
+        .await
+        .into_vec::<f32>()
+        .expect("Wrong tensor type");
+
+    // Map float values to grayscale u8 values (0 or 255)
+    let image_bytes: Vec<u8> = data.into_iter().map(|v| (v * 255.0) as u8).collect();
+
+    // Create a grayscale image
+    let image = image::ImageBuffer::<image::Luma<u8>, _>::from_raw(w as u32, h as u32, image_bytes)
+        .expect("Failed to create image from tensor data");
+
+    image.save(path)?;
     Ok(())
 }
 
