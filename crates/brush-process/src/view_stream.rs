@@ -1,14 +1,21 @@
 use crate::message::ProcessMessage;
 
-use std::{pin::pin, sync::Arc};
-
 use async_fn_stream::TryStreamEmitter;
 use brush_serde;
 use brush_vfs::BrushVfs;
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{WgpuDevice, WgpuRuntime};
+use glam::{Quat, Vec3};
+use serde::Deserialize;
+use std::{path::Path, pin::pin, sync::Arc};
 use tokio_stream::StreamExt;
 use tokio_with_wasm::alias as tokio_wasm;
+
+#[derive(Deserialize)]
+struct CameraInfo {
+    focal_point: Vec3,
+    focus_distance: f32,
+}
 
 pub(crate) async fn view_stream(
     vfs: Arc<BrushVfs>,
@@ -78,6 +85,36 @@ pub(crate) async fn view_stream(
             }
         }
     }
+
+    let camera_info_path = Path::new("camera.json");
+    log::info!("Loading camera info from camera.json");
+    if let Ok(mut reader) = vfs.reader_at_path(camera_info_path).await {
+        let mut contents = Vec::new();
+        tokio_wasm::io::AsyncReadExt::read_to_end(&mut reader, &mut contents).await?;
+        let camera_info: CameraInfo = serde_json::from_slice(&contents)?;
+        emitter
+            .emit(ProcessMessage::CameraData {
+                focal_point: camera_info.focal_point,
+                focus_distance: camera_info.focus_distance,
+                rotation: Quat::from_rotation_y(std::f32::consts::PI),
+            })
+            .await;
+    } else {
+        log::warn!("camera.json not found, using default camera values.");
+    }
+
+    let metadata_path = Path::new("metadata.txt");
+    let metadata = if let Ok(mut reader) = vfs.reader_at_path(metadata_path).await {
+        log::info!("Loading metadata from metadata.txt");
+        let mut contents = String::new();
+        tokio_wasm::io::AsyncReadExt::read_to_string(&mut reader, &mut contents).await?;
+        contents
+    } else {
+        log::warn!("metadata.txt not found, using empty metadata.");
+        String::new()
+    };
+
+    emitter.emit(ProcessMessage::ObjectMetadata { metadata }).await;
 
     emitter.emit(ProcessMessage::DoneLoading).await;
 

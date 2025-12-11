@@ -19,7 +19,7 @@ use web_time::Instant;
 
 use crate::{
     UiMode, app::CameraSettings, burn_texture::BurnTexture, draw_checkerboard, panels::AppPane,
-    ui_process::UiProcess, widget_3d::Widget3D,
+    ui_process::{self, UiProcess}, widget_3d::Widget3D,
 };
 
 #[derive(Clone, PartialEq)]
@@ -97,6 +97,8 @@ pub struct ScenePanel {
     view_splats: Vec<Splats<MainBackend>>,
     view_auxiliary_splats: HashMap<String, Splats<MainBackend>>,
 
+    object_metadata: String,
+
     fully_loaded: bool,
     frame_count: u32,
     frame: f32,
@@ -140,6 +142,7 @@ impl ScenePanel {
             warnings: vec![],
             view_splats: vec![],
             view_auxiliary_splats: HashMap::new(),
+            object_metadata: String::new(),
             live_update: true,
             paused: false,
             last_state: None,
@@ -645,6 +648,12 @@ impl AppPane for ScenePanel {
             }
             ProcessMessage::Warning { error } => {
                 self.warnings.push(ErrorDisplay::new(error));
+            }
+            ProcessMessage::CameraData { focal_point, focus_distance, rotation } => {
+                process.set_focal_point(*focal_point, *focus_distance, *rotation);
+            }
+            ProcessMessage::ObjectMetadata { metadata } => {
+                self.object_metadata = metadata.clone();
             }
             _ => {}
         }

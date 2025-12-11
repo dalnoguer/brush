@@ -2,7 +2,7 @@ use brush_dataset::Dataset;
 use brush_render::MainBackend;
 use brush_render::gaussian_splats::Splats;
 use brush_train::msg::{RefineStats, TrainStepStats};
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use web_time::Duration;
 
 pub enum ProcessMessage {
@@ -60,4 +60,12 @@ pub enum ProcessMessage {
         error: anyhow::Error,
     },
     DoneTraining,
+    CameraData {
+        focal_point: Vec3,
+        focus_distance: f32,
+        rotation: Quat,
+    },
+    ObjectMetadata {
+        metadata: String,
+    }
 }
