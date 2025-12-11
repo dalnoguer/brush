@@ -21,6 +21,11 @@ pub enum ProcessMessage {
         total_frames: u32,
         progress: f32,
     },
+    /// Loaded an auxiliary splat from a ply file.
+    ViewAuxiliarySplat {
+        name: String,
+        splats: Box<Splats<MainBackend>>,
+    },
     /// Loaded a bunch of viewpoints to train on.
     Dataset {
         dataset: Dataset,

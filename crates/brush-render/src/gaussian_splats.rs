@@ -215,6 +215,31 @@ impl<B: Backend> Splats<B> {
         self
     }
 
+    pub fn append(mut self, mut other: Self) -> Self {
+        if self.num_splats() == 0 {
+            return other;
+        }
+        if other.num_splats() == 0 {
+            return self;
+        }
+
+        let sh_degree_self = self.sh_degree();
+        let sh_degree_other = other.sh_degree();
+        if sh_degree_self > sh_degree_other {
+            other = other.with_sh_degree(sh_degree_self);
+        } else if sh_degree_other > sh_degree_self {
+            self = self.with_sh_degree(sh_degree_other);
+        }
+
+        Self::from_tensor_data(
+            Tensor::cat(vec![self.means.val(), other.means.val()], 0),
+            Tensor::cat(vec![self.rotation.val(), other.rotation.val()], 0),
+            Tensor::cat(vec![self.log_scales.val(), other.log_scales.val()], 0),
+            Tensor::cat(vec![self.sh_coeffs.val(), other.sh_coeffs.val()], 0),
+            Tensor::cat(vec![self.raw_opacity.val(), other.raw_opacity.val()], 0),
+        )
+    }
+
     pub fn from_tensor_data(
         means: Tensor<B, 2>,
         rotation: Tensor<B, 2>,

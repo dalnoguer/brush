@@ -1,16 +1,16 @@
 use brush_dataset::config::AlphaMode;
 use brush_process::message::ProcessMessage;
-use core::f32;
+use std::{collections::HashMap, sync::Arc};
 use egui::{Align2, Area, Frame, Pos2, Ui, epaint::mutex::RwLock as EguiRwLock};
-use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use brush_render::{
-    MainBackend,
+    sh::rgb_to_sh, MainBackend,
     camera::{Camera, focal_to_fov, fov_to_focal},
     gaussian_splats::Splats,
 };
 use eframe::egui_wgpu::Renderer;
+use burn::tensor::{Tensor, s};
 use egui::{Color32, Rect, Slider, collapsing_header::CollapsingState};
 use glam::{UVec2, Vec3};
 use tokio_with_wasm::alias as tokio_wasm;
@@ -29,6 +29,7 @@ struct RenderState {
     frame: f32,
     settings: CameraSettings,
     grid_opacity: f32,
+    selected_aux_splat: Option<String>,
 }
 
 struct ErrorDisplay {
@@ -94,6 +95,7 @@ pub struct ScenePanel {
     pub(crate) last_draw: Option<Instant>,
 
     view_splats: Vec<Splats<MainBackend>>,
+    view_auxiliary_splats: HashMap<String, Splats<MainBackend>>,
 
     fully_loaded: bool,
     frame_count: u32,
@@ -115,6 +117,9 @@ pub struct ScenePanel {
 
     // 3D widgets for visualization
     widget_3d: Option<Widget3D>,
+
+    // Selected auxiliary splat to render
+    selected_aux_splat: Option<String>,
 }
 
 impl ScenePanel {
@@ -134,6 +139,7 @@ impl ScenePanel {
             err: None,
             warnings: vec![],
             view_splats: vec![],
+            view_auxiliary_splats: HashMap::new(),
             live_update: true,
             paused: false,
             last_state: None,
@@ -142,6 +148,7 @@ impl ScenePanel {
             fully_loaded: false,
             export_channel: channel,
             widget_3d,
+            selected_aux_splat: None,
         }
     }
 
@@ -194,6 +201,7 @@ impl ScenePanel {
             frame: self.frame,
             settings: settings.clone(),
             grid_opacity,
+            selected_aux_splat: self.selected_aux_splat.clone(),
         };
 
         let dirty = self.last_state != Some(state.clone());
@@ -326,6 +334,32 @@ impl ScenePanel {
                 .body_unindented(|ui| {
                     ui.set_max_width(180.0);
                     ui.spacing_mut().item_spacing.y = 6.0;
+
+                    // Auxiliary splat selector
+                    if !self.view_auxiliary_splats.is_empty() {
+                        ui.label(egui::RichText::new("View").size(12.0));
+                        let selected_text = self
+                            .selected_aux_splat
+                            .as_deref()
+                            .unwrap_or("Default");
+
+                        egui::ComboBox::from_id_source("aux_splat_selector")
+                            .selected_text(selected_text)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(self.selected_aux_splat.is_none(), "Default").clicked() {
+                                    self.selected_aux_splat = None;
+                                }
+                                for name in self.view_auxiliary_splats.keys() {
+                                    if ui.selectable_label(self.selected_aux_splat.as_deref() == Some(name), name).clicked() {
+                                        self.selected_aux_splat = Some(name.clone());
+                                    }
+                                }
+                            });
+
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                    }
 
                     // Training controls
                     if process.is_training() {
@@ -535,6 +569,7 @@ impl ScenePanel {
         self.view_splats = vec![];
         self.frame_count = 0;
         self.frame = 0.0;
+        self.selected_aux_splat = None;
     }
 }
 
@@ -595,6 +630,10 @@ impl AppPane for ScenePanel {
                 if self.live_update {
                     self.last_state = None;
                 }
+            },
+            ProcessMessage::ViewAuxiliarySplat { name, splats } => {
+                self.view_auxiliary_splats
+                    .insert(name.clone(), splats.as_ref().clone());
             }
             ProcessMessage::TrainStep { splats, .. } => {
                 let splats = *splats.clone();
@@ -667,6 +706,24 @@ impl AppPane for ScenePanel {
             .floor() as usize;
 
         let splats = self.view_splats.get(frame).cloned();
+        let splats = if let (Some(mut splats), Some(name)) = (splats.clone(), &self.selected_aux_splat) {
+            if let Some(mut aux_splats) = self.view_auxiliary_splats.get(name).cloned() {
+                let yellow_sh = rgb_to_sh(Vec3::new(1.0, 1.0, 0.0));
+                let yellow_sh_tensor = Tensor::from_data([[[yellow_sh.x, yellow_sh.y, yellow_sh.z]]], &aux_splats.device())
+                    .repeat(&[aux_splats.num_splats() as usize]);
+
+                aux_splats.sh_coeffs = aux_splats.sh_coeffs.map(|sh_coeffs| {
+                    let mut sh_coeffs = sh_coeffs.clone();
+                    sh_coeffs = sh_coeffs.slice_assign(s![.., 0..1, ..], yellow_sh_tensor);
+                    sh_coeffs
+                });
+                splats = splats.append(aux_splats.clone());
+            }
+            Some(splats)
+        } else {
+            splats
+        };
+
         let interactive = matches!(process.ui_mode(), UiMode::Default | UiMode::FullScreenSplat);
         let rect = self.draw_splats(ui, process, splats.clone(), interactive);
 

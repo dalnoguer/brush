@@ -206,7 +206,8 @@ pub async fn process_ui(
             }
             ProcessMessage::DoneTraining => {
                 log::info!("Done training.");
-            }
+            },
+            _ => {},
         }
     }
 

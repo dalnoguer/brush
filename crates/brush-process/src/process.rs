@@ -39,13 +39,8 @@ pub fn process_stream(
             ply_count
         );
 
-        if vfs_counts == ply_count {
-            drop(process_args);
-            view_stream(vfs, device, emitter).await?;
-        } else {
-            // Receive the processing args.
-            train_stream(vfs, process_args, device, emitter).await?;
-        };
+        drop(process_args);
+        view_stream(vfs, device, emitter).await?;
 
         Ok(())
     })
