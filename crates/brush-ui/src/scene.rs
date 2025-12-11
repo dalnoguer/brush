@@ -1,16 +1,21 @@
 use brush_dataset::config::AlphaMode;
 use brush_process::message::ProcessMessage;
-use std::{collections::HashMap, sync::Arc};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use egui::{Align2, Area, Frame, Pos2, Ui, epaint::mutex::RwLock as EguiRwLock};
+use parking_lot::Mutex;
+use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use brush_render::{
-    sh::rgb_to_sh, MainBackend,
+    MainBackend,
     camera::{Camera, focal_to_fov, fov_to_focal},
     gaussian_splats::Splats,
+    sh::rgb_to_sh,
 };
-use eframe::egui_wgpu::Renderer;
 use burn::tensor::{Tensor, s};
+use eframe::egui_wgpu::Renderer;
 use egui::{Color32, Rect, Slider, collapsing_header::CollapsingState};
 use glam::{UVec2, Vec3};
 use tokio_with_wasm::alias as tokio_wasm;
@@ -18,8 +23,13 @@ use tracing::trace_span;
 use web_time::Instant;
 
 use crate::{
-    UiMode, app::CameraSettings, burn_texture::BurnTexture, draw_checkerboard, panels::AppPane,
-    ui_process::{self, UiProcess}, widget_3d::Widget3D,
+    UiMode,
+    app::CameraSettings,
+    burn_texture::BurnTexture,
+    draw_checkerboard,
+    panels::AppPane,
+    ui_process::UiProcess,
+    widget_3d::Widget3D,
 };
 
 #[derive(Clone, PartialEq)]
@@ -30,6 +40,10 @@ struct RenderState {
     settings: CameraSettings,
     grid_opacity: f32,
     selected_aux_splat: Option<String>,
+}
+
+pub enum SceneCommand {
+    SelectSplat(Option<String>),
 }
 
 struct ErrorDisplay {
@@ -63,6 +77,14 @@ async fn export(splat: Splats<MainBackend>) -> Result<(), anyhow::Error> {
     let data = brush_serde::splat_to_ply(splat).await?;
     rrfd::save_file("export.ply", data).await?;
     Ok(())
+}
+
+#[derive(Default)]
+enum AudioState {
+    #[default]
+    Idle,
+    Recording,
+    Playing,
 }
 
 fn box_ui<R>(
@@ -106,6 +128,8 @@ pub struct ScenePanel {
     // Ui state.
     live_update: bool,
     paused: bool,
+    audio_state: Arc<Mutex<AudioState>>,
+    recording_stop_signal: Option<Arc<AtomicBool>>,
     err: Option<ErrorDisplay>,
     warnings: Vec<ErrorDisplay>,
 
@@ -113,6 +137,9 @@ pub struct ScenePanel {
         UnboundedSender<anyhow::Error>,
         UnboundedReceiver<anyhow::Error>,
     ),
+
+    command_tx: UnboundedSender<SceneCommand>,
+    command_rx: UnboundedReceiver<SceneCommand>,
 
     // Keep track of what was last rendered.
     last_state: Option<RenderState>,
@@ -135,6 +162,8 @@ impl ScenePanel {
         // Create Widget3D for 3D overlay rendering
         let widget_3d = Some(Widget3D::new(device.clone(), queue.clone()));
 
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+
         Self {
             backbuffer: BurnTexture::new(renderer, device, queue),
             last_draw: None,
@@ -145,6 +174,7 @@ impl ScenePanel {
             object_metadata: String::new(),
             live_update: true,
             paused: false,
+            audio_state: Arc::new(Mutex::new(AudioState::default())),
             last_state: None,
             frame_count: 0,
             frame: 0.0,
@@ -152,6 +182,9 @@ impl ScenePanel {
             export_channel: channel,
             widget_3d,
             selected_aux_splat: None,
+            recording_stop_signal: None,
+            command_tx,
+            command_rx,
         }
     }
 
@@ -341,19 +374,25 @@ impl ScenePanel {
                     // Auxiliary splat selector
                     if !self.view_auxiliary_splats.is_empty() {
                         ui.label(egui::RichText::new("View").size(12.0));
-                        let selected_text = self
-                            .selected_aux_splat
-                            .as_deref()
-                            .unwrap_or("Default");
+                        let selected_text = self.selected_aux_splat.as_deref().unwrap_or("Default");
 
                         egui::ComboBox::from_id_source("aux_splat_selector")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
-                                if ui.selectable_label(self.selected_aux_splat.is_none(), "Default").clicked() {
+                                if ui
+                                    .selectable_label(self.selected_aux_splat.is_none(), "Default")
+                                    .clicked()
+                                {
                                     self.selected_aux_splat = None;
                                 }
                                 for name in self.view_auxiliary_splats.keys() {
-                                    if ui.selectable_label(self.selected_aux_splat.as_deref() == Some(name), name).clicked() {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_aux_splat.as_deref() == Some(name),
+                                            name,
+                                        )
+                                        .clicked()
+                                    {
                                         self.selected_aux_splat = Some(name.clone());
                                     }
                                 }
@@ -472,8 +511,6 @@ impl ScenePanel {
                             process.set_cam_settings(&settings);
                         }
                     });
-
-                    ui.add_space(4.0);
                 });
         };
 
@@ -513,6 +550,64 @@ impl ScenePanel {
                         });
                 });
         }
+    }
+
+    fn draw_gemini_button(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let id = ui.auto_id_with("ask_gemini_button");
+        Area::new(id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(rect.min.x + 10.0, rect.max.y - 40.0))
+            .show(ui.ctx(), |ui| {
+                // Determine UI appearance based on state
+                // Note: We lock briefly to read state to avoid holding lock during UI draw
+                let current_state_enum = {
+                    let s = self.audio_state.lock();
+                    match *s {
+                        AudioState::Idle => 0,
+                        AudioState::Recording => 1,
+                        AudioState::Playing => 2,
+                    }
+                };
+
+                let (text, fill) = match current_state_enum {
+                    0 => (
+                        "✨ Ask Gemini".to_string(),
+                        egui::Color32::from_rgb(60, 120, 200),
+                    ),
+                    1 => (
+                        "⏹ Stop Recording".to_string(), // Changed to Stop icon
+                        egui::Color32::from_rgb(200, 60, 60),
+                    ),
+                    2 => (
+                        "▶️ Playing...".to_string(),
+                        egui::Color32::from_rgb(60, 200, 120),
+                    ),
+                    _ => unreachable!(),
+                };
+
+                let button = egui::Button::new(
+                    egui::RichText::new(text).strong().color(Color32::WHITE)
+                ).fill(fill);
+
+                if ui.add(button).clicked() {
+                    let mut state = self.audio_state.lock();
+                    match *state {
+                        AudioState::Idle => {
+                            *state = AudioState::Recording;
+                            // Release lock before starting async work to prevent deadlocks
+                            drop(state); 
+                            self.start_recording(ui.ctx().clone());
+                        }
+                        AudioState::Recording => {
+                            // The worker thread will set this back to Idle when done
+                            *state = AudioState::Playing; 
+                            drop(state);
+                            self.stop_recording();
+                        }
+                        _ => {}
+                    }
+                }
+            });
     }
 
     fn draw_warnings(&mut self, ui: &egui::Ui, pos: Pos2) {
@@ -633,7 +728,7 @@ impl AppPane for ScenePanel {
                 if self.live_update {
                     self.last_state = None;
                 }
-            },
+            }
             ProcessMessage::ViewAuxiliarySplat { name, splats } => {
                 self.view_auxiliary_splats
                     .insert(name.clone(), splats.as_ref().clone());
@@ -649,7 +744,11 @@ impl AppPane for ScenePanel {
             ProcessMessage::Warning { error } => {
                 self.warnings.push(ErrorDisplay::new(error));
             }
-            ProcessMessage::CameraData { focal_point, focus_distance, rotation } => {
+            ProcessMessage::CameraData {
+                focal_point,
+                focus_distance,
+                rotation,
+            } => {
                 process.set_focal_point(*focal_point, *focus_distance, *rotation);
             }
             ProcessMessage::ObjectMetadata { metadata } => {
@@ -664,6 +763,15 @@ impl AppPane for ScenePanel {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, process: &UiProcess) {
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            match cmd {
+                SceneCommand::SelectSplat(name) => {
+                    self.selected_aux_splat = name;
+                    self.last_state = None; 
+                }
+            }
+        }
+
         if let Some(err) = self.err.as_ref() {
             err.draw(ui);
             return;
@@ -715,23 +823,27 @@ impl AppPane for ScenePanel {
             .floor() as usize;
 
         let splats = self.view_splats.get(frame).cloned();
-        let splats = if let (Some(mut splats), Some(name)) = (splats.clone(), &self.selected_aux_splat) {
-            if let Some(mut aux_splats) = self.view_auxiliary_splats.get(name).cloned() {
-                let yellow_sh = rgb_to_sh(Vec3::new(1.0, 1.0, 0.0));
-                let yellow_sh_tensor = Tensor::from_data([[[yellow_sh.x, yellow_sh.y, yellow_sh.z]]], &aux_splats.device())
+        let splats =
+            if let (Some(mut splats), Some(name)) = (splats.clone(), &self.selected_aux_splat) {
+                if let Some(mut aux_splats) = self.view_auxiliary_splats.get(name).cloned() {
+                    let yellow_sh = rgb_to_sh(Vec3::new(1.0, 1.0, 0.0));
+                    let yellow_sh_tensor = Tensor::from_data(
+                        [[[yellow_sh.x, yellow_sh.y, yellow_sh.z]]],
+                        &aux_splats.device(),
+                    )
                     .repeat(&[aux_splats.num_splats() as usize]);
 
-                aux_splats.sh_coeffs = aux_splats.sh_coeffs.map(|sh_coeffs| {
-                    let mut sh_coeffs = sh_coeffs.clone();
-                    sh_coeffs = sh_coeffs.slice_assign(s![.., 0..1, ..], yellow_sh_tensor);
-                    sh_coeffs
-                });
-                splats = splats.append(aux_splats.clone());
-            }
-            Some(splats)
-        } else {
-            splats
-        };
+                    aux_splats.sh_coeffs = aux_splats.sh_coeffs.map(|sh_coeffs| {
+                        let mut sh_coeffs = sh_coeffs.clone();
+                        sh_coeffs = sh_coeffs.slice_assign(s![.., 0..1, ..], yellow_sh_tensor);
+                        sh_coeffs
+                    });
+                    splats = splats.append(aux_splats.clone());
+                }
+                Some(splats)
+            } else {
+                splats
+            };
 
         let interactive = matches!(process.ui_mode(), UiMode::Default | UiMode::FullScreenSplat);
         let rect = self.draw_splats(ui, process, splats.clone(), interactive);
@@ -739,7 +851,13 @@ impl AppPane for ScenePanel {
         if interactive {
             // Floating play/pause button if needed.
             self.draw_play_pause(ui, rect);
-            self.controls_box(ui, process, splats, egui::pos2(rect.min.x, rect.min.y));
+            self.controls_box(
+                ui,
+                process,
+                splats,
+                egui::pos2(rect.min.x + 6.0, rect.min.y + 6.0),
+            );
+            self.draw_gemini_button(ui, rect);
             let pos = egui::pos2(ui.available_rect_before_wrap().max.x, rect.min.y);
             self.draw_warnings(ui, pos);
         }
@@ -747,5 +865,192 @@ impl AppPane for ScenePanel {
 
     fn inner_margin(&self) -> f32 {
         0.0
+    }
+}
+
+impl ScenePanel {
+    fn start_recording(&mut self, ctx: egui::Context) {
+        let audio_state = self.audio_state.clone();
+        
+        // Signal to stop recording loop
+        let stop_signal = Arc::new(AtomicBool::new(false));
+        self.recording_stop_signal = Some(stop_signal.clone());
+
+        let cmd_sender = self.command_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let host = cpal::default_host();
+            
+            // --- 1. SETUP INPUT ---
+            let input_device = match host.default_input_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("No input device found");
+                    *audio_state.lock() = AudioState::Idle;
+                    return;
+                }
+            };
+
+            let input_config = match input_device.default_input_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error getting input config: {}", e);
+                    *audio_state.lock() = AudioState::Idle;
+                    return;
+                }
+            };
+
+            let source_sample_rate = input_config.sample_rate().0;
+            let recorded_samples = Arc::new(Mutex::new(Vec::new()));
+            let writer_handle = recorded_samples.clone();
+            
+            let err_fn = move |err| eprintln!("Stream error: {}", err);
+
+            let input_stream = match input_config.sample_format() {
+                cpal::SampleFormat::F32 => input_device.build_input_stream(
+                    &input_config.into(),
+                    move |data: &[f32], _: &_| {
+                        writer_handle.lock().extend_from_slice(data);
+                    },
+                    err_fn.clone(),
+                    None 
+                ),
+                _ => return, // Simplified error handling
+            };
+
+            // --- 2. RECORDING LOOP ---
+            if let Ok(stream) = input_stream {
+                stream.play().unwrap();
+                
+                // Wait until UI signals stop
+                while !stop_signal.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                drop(stream); // Stop recording
+            }
+
+            // --- 3. PROCESSING & PLAYBACK PREP ---
+            let raw_data = recorded_samples.lock().clone();
+            if raw_data.is_empty() {
+                *audio_state.lock() = AudioState::Idle;
+                return;
+            }
+
+            // A: Resample for AI (16kHz) - Keep this for your API call later
+            let ai_sample_rate = 16000;
+            let _ai_audio = resample_audio(&raw_data, source_sample_rate, ai_sample_rate);
+            println!("Processed {} samples for AI.", _ai_audio.len());
+
+            // --- 4. PLAYBACK LOGIC ---
+            // Only play if state is "Playing" (which the Stop button sets)
+            let should_play = matches!(*audio_state.lock(), AudioState::Playing);            
+
+            // Change the overlay with gemini's output. Hardcoded for now.
+            let _ = cmd_sender.send(SceneCommand::SelectSplat(Some("the_base".to_string())));
+            ctx.request_repaint();
+            
+            if should_play {
+                if let Some(output_device) = host.default_output_device() {
+                    if let Ok(output_config) = output_device.default_output_config() {
+                        let output_sample_rate = output_config.sample_rate().0;
+                        let channels = output_config.channels() as usize;
+
+                        // Resample raw audio to match the speaker's sample rate
+                        // (We use raw_data here for better quality than the 16kHz AI version)
+                        let playback_data = resample_audio(&raw_data, source_sample_rate, output_sample_rate as usize);
+                        
+                        // Setup cursor for playback callback
+                        let playback_cursor = Arc::new(AtomicUsize::new(0));
+                        let cursor_read = playback_cursor.clone();
+                        let samples_to_play = playback_data.clone();
+
+                        let output_stream = output_device.build_output_stream(
+                            &output_config.into(),
+                            move |data: &mut [f32], _: &_| {
+                                let mut cursor = cursor_read.load(Ordering::Relaxed);
+                                for frame in data.chunks_mut(channels) {
+                                    if cursor < samples_to_play.len() {
+                                        let sample = samples_to_play[cursor];
+                                        cursor += 1;
+                                        // Copy mono sample to all output channels (stereo/etc)
+                                        for channel in frame {
+                                            *channel = sample; 
+                                        }
+                                    } else {
+                                        // Silence if finished
+                                        for channel in frame {
+                                            *channel = 0.0;
+                                        }
+                                    }
+                                }
+                                cursor_read.store(cursor, Ordering::Relaxed);
+                            },
+                            move |err| eprintln!("Output error: {}", err),
+                            None
+                        );
+
+                        if let Ok(stream) = output_stream {
+                            stream.play().unwrap();
+
+                            // Block thread until playback finishes
+                            loop {
+                                let pos = playback_cursor.load(Ordering::Relaxed);
+                                if pos >= playback_data.len() {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            // Give a small buffer for the last chunk to actually play out
+                            std::thread::sleep(std::time::Duration::from_millis(200)); 
+                        }
+                    } else {
+                        eprintln!("Failed to get output config");
+                    }
+                } else {
+                    eprintln!("No output device found");
+                }
+            }
+
+            // --- 5. CLEANUP ---
+            *audio_state.lock() = AudioState::Idle;
+            println!("Audio cycle complete.");
+        });
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(signal) = &self.recording_stop_signal {
+            signal.store(true, Ordering::Relaxed);
+        }
+        self.recording_stop_signal = None;
+    }
+}
+
+// Standalone helper function for Resampling (keeps the struct clean)
+fn resample_audio(input: &[f32], from_hz: u32, to_hz: usize) -> Vec<f32> {
+    if from_hz as usize == to_hz {
+        return input.to_vec();
+    }
+
+    // Prepare Rubato Resampler
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: rubato::WindowFunction::BlackmanHarris2,
+    };
+
+    let mut resampler = SincFixedIn::<f32>::new(
+        to_hz as f64 / from_hz as f64,
+        2.0,
+        params,
+        input.len(), 
+        1
+    ).unwrap();
+
+    let waves_in = vec![input.to_vec()];
+    match resampler.process(&waves_in, None) {
+        Ok(waves_out) => waves_out[0].clone(),
+        Err(_) => input.to_vec(), // Fallback on error
     }
 }

@@ -33,6 +33,8 @@ tokio-stream.workspace = true
 parking_lot.workspace = true
 wasm-bindgen.workspace = true
 bytemuck = { version = "1.14", features = ["derive"] }
+cpal = "0.16.0"
+rubato = "0.16.2"
 
 [lints]
 workspace = true
