@@ -1,12 +1,14 @@
 use brush_dataset::config::AlphaMode;
 use brush_process::message::ProcessMessage;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use egui::TextBuffer;
 use egui::{Align2, Area, Frame, Pos2, Ui, epaint::mutex::RwLock as EguiRwLock};
 use parking_lot::Mutex;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::io::Write;
 
 use brush_render::{
     MainBackend,
@@ -21,6 +23,8 @@ use glam::{UVec2, Vec3};
 use tokio_with_wasm::alias as tokio_wasm;
 use tracing::trace_span;
 use web_time::Instant;
+
+use brush_gemini::GeminiClient;
 
 use crate::{
     UiMode,
@@ -79,11 +83,12 @@ async fn export(splat: Splats<MainBackend>) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Clone, Copy)]
 enum AudioState {
     #[default]
     Idle,
     Recording,
+    Thinking,
     Playing,
 }
 
@@ -120,6 +125,7 @@ pub struct ScenePanel {
     view_auxiliary_splats: HashMap<String, Splats<MainBackend>>,
 
     object_metadata: String,
+    gemini_client: Option<Arc<GeminiClient>>,
 
     fully_loaded: bool,
     frame_count: u32,
@@ -185,6 +191,7 @@ impl ScenePanel {
             recording_stop_signal: None,
             command_tx,
             command_rx,
+            gemini_client: None,
         }
     }
 
@@ -559,48 +566,49 @@ impl ScenePanel {
             .fixed_pos(egui::pos2(rect.min.x + 10.0, rect.max.y - 40.0))
             .show(ui.ctx(), |ui| {
                 // Determine UI appearance based on state
-                // Note: We lock briefly to read state to avoid holding lock during UI draw
-                let current_state_enum = {
-                    let s = self.audio_state.lock();
-                    match *s {
-                        AudioState::Idle => 0,
-                        AudioState::Recording => 1,
-                        AudioState::Playing => 2,
-                    }
-                };
+                let current_state = *self.audio_state.lock();
 
-                let (text, fill) = match current_state_enum {
-                    0 => (
+                let (text, fill, enabled) = match current_state {
+                    AudioState::Idle => (
                         "✨ Ask Gemini".to_string(),
                         egui::Color32::from_rgb(60, 120, 200),
+                        true,
                     ),
-                    1 => (
+                    AudioState::Recording => (
                         "⏹ Stop Recording".to_string(), // Changed to Stop icon
                         egui::Color32::from_rgb(200, 60, 60),
+                        true,
                     ),
-                    2 => (
+                    AudioState::Thinking => (
+                        "🤔 Thinking...".to_string(),
+                        egui::Color32::from_rgb(120, 120, 120),
+                        false,
+                    ),
+                    AudioState::Playing => (
                         "▶️ Playing...".to_string(),
                         egui::Color32::from_rgb(60, 200, 120),
+                        false,
                     ),
-                    _ => unreachable!(),
                 };
 
-                let button = egui::Button::new(
+                let mut button = egui::Button::new(
                     egui::RichText::new(text).strong().color(Color32::WHITE)
                 ).fill(fill);
 
-                if ui.add(button).clicked() {
+                if !enabled {
+                    button = button.sense(egui::Sense::hover());
+                }
+
+                if ui.add(button).clicked() && enabled {
                     let mut state = self.audio_state.lock();
                     match *state {
                         AudioState::Idle => {
                             *state = AudioState::Recording;
-                            // Release lock before starting async work to prevent deadlocks
-                            drop(state); 
+                            drop(state);
                             self.start_recording(ui.ctx().clone());
                         }
                         AudioState::Recording => {
-                            // The worker thread will set this back to Idle when done
-                            *state = AudioState::Playing; 
+                            *state = AudioState::Thinking;
                             drop(state);
                             self.stop_recording();
                         }
@@ -754,6 +762,26 @@ impl AppPane for ScenePanel {
             ProcessMessage::ObjectMetadata { metadata } => {
                 self.object_metadata = metadata.clone();
             }
+            ProcessMessage::DoneLoading {} => {
+                
+                let system_instructions = &self.object_metadata;
+                let mut keywords = self
+                    .view_auxiliary_splats
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<String>>();
+                keywords.push("nothing".to_string());
+                match GeminiClient::new(system_instructions, keywords) {
+                    Ok(client) => {
+                        self.gemini_client = Some(Arc::new(client));
+                    }
+                    Err(e) => {
+                        eprintln!("Error initializing GeminiClient: {}", e);
+                    }
+                }
+
+                process.set_ui_mode(UiMode::FullScreenSplat);
+            }
             _ => {}
         }
     }
@@ -870,6 +898,14 @@ impl AppPane for ScenePanel {
 
 impl ScenePanel {
     fn start_recording(&mut self, ctx: egui::Context) {
+        // Ensure we have a client before starting
+        let gemini_client = if let Some(client) = self.gemini_client.clone() {
+            client
+        } else {
+            eprintln!("Gemini client not initialized");
+            return;
+        };
+
         let audio_state = self.audio_state.clone();
         
         // Signal to stop recording loop
@@ -877,6 +913,9 @@ impl ScenePanel {
         self.recording_stop_signal = Some(stop_signal.clone());
 
         let cmd_sender = self.command_tx.clone();
+        
+        // Grab the runtime handle so we can execute async code in the blocking task
+        let rt_handle = tokio::runtime::Handle::current();
 
         tokio::task::spawn_blocking(move || {
             let host = cpal::default_host();
@@ -915,105 +954,140 @@ impl ScenePanel {
                     err_fn.clone(),
                     None 
                 ),
-                _ => return, // Simplified error handling
+                _ => return, 
             };
 
             // --- 2. RECORDING LOOP ---
             if let Ok(stream) = input_stream {
                 stream.play().unwrap();
+                println!("Recording started...");
                 
-                // Wait until UI signals stop
                 while !stop_signal.load(Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                drop(stream); // Stop recording
+                drop(stream);
+                println!("Recording stopped.");
             }
 
-            // --- 3. PROCESSING & PLAYBACK PREP ---
+            // --- 3. PROCESSING INPUT FOR GEMINI ---
             let raw_data = recorded_samples.lock().clone();
             if raw_data.is_empty() {
                 *audio_state.lock() = AudioState::Idle;
                 return;
             }
 
-            // A: Resample for AI (16kHz) - Keep this for your API call later
-            let ai_sample_rate = 16000;
-            let _ai_audio = resample_audio(&raw_data, source_sample_rate, ai_sample_rate);
-            println!("Processed {} samples for AI.", _ai_audio.len());
-
-            // --- 4. PLAYBACK LOGIC ---
-            // Only play if state is "Playing" (which the Stop button sets)
-            let should_play = matches!(*audio_state.lock(), AudioState::Playing);            
-
-            // Change the overlay with gemini's output. Hardcoded for now.
-            let _ = cmd_sender.send(SceneCommand::SelectSplat(Some("the_base".to_string())));
-            ctx.request_repaint();
+            // A: Resample to 16kHz for Gemini (Standard Speech-to-Text preference)
+            let gemini_input_rate = 16000;
+            let resampled_for_ai = resample_audio(&raw_data, source_sample_rate, gemini_input_rate as usize);
             
-            if should_play {
-                if let Some(output_device) = host.default_output_device() {
-                    if let Ok(output_config) = output_device.default_output_config() {
-                        let output_sample_rate = output_config.sample_rate().0;
-                        let channels = output_config.channels() as usize;
+            // B: Convert to WAV format (i16)
+            let pcm_i16 = f32_to_i16(&resampled_for_ai);
+            let wav_buffer = create_wav_buffer(&pcm_i16, gemini_input_rate);
 
-                        // Resample raw audio to match the speaker's sample rate
-                        // (We use raw_data here for better quality than the 16kHz AI version)
-                        let playback_data = resample_audio(&raw_data, source_sample_rate, output_sample_rate as usize);
-                        
-                        // Setup cursor for playback callback
-                        let playback_cursor = Arc::new(AtomicUsize::new(0));
-                        let cursor_read = playback_cursor.clone();
-                        let samples_to_play = playback_data.clone();
+            println!("Sending {} bytes of WAV audio to Gemini...", wav_buffer.len());
 
-                        let output_stream = output_device.build_output_stream(
-                            &output_config.into(),
-                            move |data: &mut [f32], _: &_| {
-                                let mut cursor = cursor_read.load(Ordering::Relaxed);
-                                for frame in data.chunks_mut(channels) {
-                                    if cursor < samples_to_play.len() {
-                                        let sample = samples_to_play[cursor];
-                                        cursor += 1;
-                                        // Copy mono sample to all output channels (stereo/etc)
-                                        for channel in frame {
-                                            *channel = sample; 
-                                        }
-                                    } else {
-                                        // Silence if finished
-                                        for channel in frame {
-                                            *channel = 0.0;
-                                        }
-                                    }
-                                }
-                                cursor_read.store(cursor, Ordering::Relaxed);
-                            },
-                            move |err| eprintln!("Output error: {}", err),
-                            None
-                        );
+            // Set state to Thinking before the API call
+            *audio_state.lock() = AudioState::Thinking;
 
-                        if let Ok(stream) = output_stream {
-                            stream.play().unwrap();
+            // --- 4. CALL GEMINI (Async Bridge) ---
+            let response_result = rt_handle.block_on(async {
+                gemini_client.ask_guide(wav_buffer, "audio/wav").await
+            });
 
-                            // Block thread until playback finishes
-                            loop {
-                                let pos = playback_cursor.load(Ordering::Relaxed);
-                                if pos >= playback_data.len() {
-                                    break;
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                            // Give a small buffer for the last chunk to actually play out
-                            std::thread::sleep(std::time::Duration::from_millis(200)); 
+            match response_result {
+                Ok(response) => {
+                    println!("Gemini responded: {}", response.text_output);
+                    
+                    // --- 5. HANDLE UI COMMANDS (Keywords) ---
+                    // If Gemini selected keywords, find the first matching auxiliary splat and select it
+                    if !response.keywords.is_empty() {
+                        println!("Keywords: {:?}", response.keywords);
+                        // Send the first keyword that matches one of our splats? 
+                        // Or just send the first keyword and let the UI decide.
+                        if let Some(first_kw) = response.keywords.first() {
+                            let _ = cmd_sender.send(SceneCommand::SelectSplat(Some(first_kw.clone())));
+                            ctx.request_repaint();
                         }
-                    } else {
-                        eprintln!("Failed to get output config");
                     }
-                } else {
-                    eprintln!("No output device found");
+
+                    // --- 6. PREPARE AUDIO OUTPUT ---
+                    // Gemini TTS returns 24kHz, 16-bit PCM, Mono
+                    let tts_sample_rate = 24000; 
+                    
+                    // Set state to Playing before starting playback
+                    *audio_state.lock() = AudioState::Playing;
+
+                    // Convert raw bytes (i16) -> f32 for playback
+                    let audio_f32 = i16_bytes_to_f32(&response.audio_output);
+
+                    let should_play = matches!(*audio_state.lock(), AudioState::Playing);            
+                    
+                    if should_play && !audio_f32.is_empty() {
+                        if let Some(output_device) = host.default_output_device() {
+                            if let Ok(output_config) = output_device.default_output_config() {
+                                let output_sample_rate = output_config.sample_rate().0;
+                                let channels = output_config.channels() as usize;
+
+                                // Resample Gemini (24k) to Device (e.g., 48k)
+                                let playback_data = resample_audio(&audio_f32, tts_sample_rate, output_sample_rate as usize);
+                                
+                                let playback_cursor = Arc::new(AtomicUsize::new(0));
+                                let cursor_read = playback_cursor.clone();
+                                let samples_to_play = playback_data.clone();
+
+                                let output_stream = output_device.build_output_stream(
+                                    &output_config.into(),
+                                    move |data: &mut [f32], _: &_| {
+                                        let mut cursor = cursor_read.load(Ordering::Relaxed);
+                                        for frame in data.chunks_mut(channels) {
+                                            if cursor < samples_to_play.len() {
+                                                let sample = samples_to_play[cursor];
+                                                cursor += 1;
+                                                for channel in frame {
+                                                    *channel = sample; 
+                                                }
+                                            } else {
+                                                for channel in frame {
+                                                    *channel = 0.0;
+                                                }
+                                            }
+                                        }
+                                        cursor_read.store(cursor, Ordering::Relaxed);
+                                    },
+                                    move |err| eprintln!("Output error: {}", err),
+                                    None
+                                );
+
+                                if let Ok(stream) = output_stream {
+                                    stream.play().unwrap();
+                                    
+                                    // Wait for playback
+                                    loop {
+                                        let pos = playback_cursor.load(Ordering::Relaxed);
+                                        if pos >= playback_data.len() {
+                                            break;
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+
+                                    // Reset the selected splat after playback
+                                    let _ = cmd_sender.send(SceneCommand::SelectSplat(None));
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Gemini API Error: {}", e);
+                    // You might want to send a SceneCommand::Error here if you have one
                 }
             }
 
-            // --- 5. CLEANUP ---
+            // --- 7. CLEANUP ---
             *audio_state.lock() = AudioState::Idle;
-            println!("Audio cycle complete.");
+            println!("Interaction complete.");
         });
     }
 
@@ -1053,4 +1127,59 @@ fn resample_audio(input: &[f32], from_hz: u32, to_hz: usize) -> Vec<f32> {
         Ok(waves_out) => waves_out[0].clone(),
         Err(_) => input.to_vec(), // Fallback on error
     }
+}
+
+/// Converts f32 samples (-1.0 to 1.0) to i16 samples for WAV encoding
+fn f32_to_i16(input: &[f32]) -> Vec<i16> {
+    input.iter().map(|&sample| {
+        let sample = sample.clamp(-1.0, 1.0);
+        (sample * 32767.0) as i16
+    }).collect()
+}
+
+/// Converts raw i16 bytes (Little Endian) from Gemini to f32 for processing
+fn i16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            let val = i16::from_le_bytes([chunk[0], chunk[1]]);
+            val as f32 / 32768.0
+        })
+        .collect()
+}
+
+/// Creates a standard WAV header and appends the PCM data
+fn create_wav_buffer(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let num_channels: u16 = 1;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * num_channels as u32 * bits_per_sample as u32 / 8;
+    let block_align = num_channels * bits_per_sample / 8;
+    let data_size = samples.len() as u32 * block_align as u32;
+
+    // RIFF Header
+    buffer.write_all(b"RIFF").unwrap();
+    buffer.write_all(&(36 + data_size).to_le_bytes()).unwrap(); // ChunkSize
+    buffer.write_all(b"WAVE").unwrap();
+
+    // fmt sub-chunk
+    buffer.write_all(b"fmt ").unwrap();
+    buffer.write_all(&16u32.to_le_bytes()).unwrap(); // Subchunk1Size (16 for PCM)
+    buffer.write_all(&1u16.to_le_bytes()).unwrap();   // AudioFormat (1 for PCM)
+    buffer.write_all(&num_channels.to_le_bytes()).unwrap();
+    buffer.write_all(&sample_rate.to_le_bytes()).unwrap();
+    buffer.write_all(&byte_rate.to_le_bytes()).unwrap();
+    buffer.write_all(&block_align.to_le_bytes()).unwrap();
+    buffer.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+
+    // data sub-chunk
+    buffer.write_all(b"data").unwrap();
+    buffer.write_all(&data_size.to_le_bytes()).unwrap();
+
+    // Write samples
+    for &sample in samples {
+        buffer.write_all(&sample.to_le_bytes()).unwrap();
+    }
+
+    buffer
 }

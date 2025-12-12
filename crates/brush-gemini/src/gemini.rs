@@ -1,10 +1,11 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use gemini_rust::{Gemini, Model, GenerationConfig, Part, PrebuiltVoiceConfig, SpeechConfig, VoiceConfig};
-use rodio::{OutputStream, Sink, Source};
+use gemini_rust::{
+    Gemini, GenerationConfig, Model, Part, PrebuiltVoiceConfig, SpeechConfig, VoiceConfig,
+};
 use rodio::buffer::SamplesBuffer;
-use serde_json::json;
+use rodio::{OutputStream, Sink, Source};
+use serde_json::{json, Value};
 use std::env;
-
 
 pub struct GeminiClient {
     client: Gemini,
@@ -26,8 +27,7 @@ impl GeminiClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let api_key =
             env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY environment variable not set");
-        let client =
-            Gemini::with_model(api_key.clone(), Model::Gemini25FlashLite)?;
+        let client = Gemini::with_model(api_key.clone(), Model::Gemini25FlashLite)?;
         let tts_client = Gemini::with_model(
             api_key.clone(),
             "models/gemini-2.5-flash-preview-tts".to_string(),
@@ -66,24 +66,38 @@ impl GeminiClient {
             "required": ["text_response", "selected_keywords"],
         });
 
-        let system_prompt = format!(
+        // 1. Create the Persona/Formatting instruction
+        let guide_persona = format!(
             "You are a professional museum guide. \
-            You answer questions based on the provided audio input and respond in JSON format according to the specified schema. \
-            You select keywords relevant to the question and your response from the provided list: {}.",
+            You answer questions based on the provided audio input and the information about the artist and art provided above. \
+            Respond in JSON format according to the specified schema. \
+            You select keywords relevant to the question and your response from the provided list: {}. \
+            Try to only refer to one keyword in each answer. If you are talking about the artist or the piece in general, select the option nothing.",
             self.keywords.join(", ")
         );
 
+        // 2. COMBINE the Art Metadata with the Persona
+        let combined_system_instruction = format!(
+            "{}\n\n--- INSTRUCTIONS ---\n{}",
+            self.system_instruction, // The Art/Artist info
+            guide_persona            // The Role/JSON info
+        );
+
+        let start_time = std::time::Instant::now();
         let maybe_response = self
             .client
             .generate_content()
-            .with_system_instruction(self.system_instruction.clone())
-            .with_system_prompt(system_prompt)
+            .with_system_instruction(combined_system_instruction)
             .with_inline_data(audio_b4, audio_format)
             .with_response_mime_type("application/json")
             .with_response_schema(schema)
             .execute()
             .await;
 
+        println!(
+            "Gemini content generation request took: {:?}",
+            start_time.elapsed()
+        );
         let response = match maybe_response {
             Ok(resp) => resp,
             Err(e) => {
@@ -92,11 +106,16 @@ impl GeminiClient {
             }
         };
 
-        let json_response: serde_json::Value = serde_json::from_str(&response.text())?;
+        let json_response: Value = serde_json::from_str(&response.text())?;
 
         let guide_response: String = json_response["text_response"].as_str().unwrap().to_string();
 
+        let tts_start_time = std::time::Instant::now();
         let audio_response = self.generate_speech(&guide_response).await?;
+        println!(
+            "generate_speech call took: {:?}",
+            tts_start_time.elapsed()
+        );
 
         let selected_keywords: Vec<String> = json_response["selected_keywords"]
             .as_array()
@@ -130,6 +149,7 @@ impl GeminiClient {
             ..Default::default()
         };
 
+        let start_time = std::time::Instant::now();
         let maybe = self
             .tts_client
             .generate_content()
@@ -137,6 +157,10 @@ impl GeminiClient {
             .with_generation_config(generation_config)
             .execute()
             .await;
+        println!(
+            "TTS generation request took: {:?}",
+            start_time.elapsed()
+        );
 
         match maybe {
             Ok(response) => {
@@ -208,7 +232,7 @@ mod tests {
         println!("Text Output: {}", gemini_response.text_output);
         println!("Keywords: {}", gemini_response.keywords.join(", "));
 
-        let channels :u16= 1;
+        let channels: u16 = 1;
         let sample_rate = 24000;
         let sample_width = 2; // bytes per sample
 
@@ -217,7 +241,7 @@ mod tests {
             .map(|b| i16::from_le_bytes([b[0], b[1]]))
             .collect();
 
-        let(_stream, stream_handle) = OutputStream::try_default().unwrap();
+        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
         let sink = Sink::try_new(&stream_handle).unwrap();
 
         let source = SamplesBuffer::new(channels, sample_rate, pcm_data_i16);

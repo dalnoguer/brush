@@ -1295,6 +1295,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "brush-dataset",
+ "brush-gemini",
  "brush-process",
  "brush-render",
  "brush-serde",
