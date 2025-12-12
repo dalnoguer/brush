@@ -4,14 +4,21 @@ use gemini_rust::{
 };
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink, Source};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
+use std::sync::{Arc, Mutex};
+
+struct Exchange {
+    user_message: String,
+    assistant_response: String,
+}
 
 pub struct GeminiClient {
     client: Gemini,
     tts_client: Gemini,
     system_instruction: String,
     keywords: Vec<String>,
+    conversation: Arc<Mutex<Vec<Exchange>>>,
 }
 
 pub struct GeminiResponse {
@@ -37,6 +44,7 @@ impl GeminiClient {
             tts_client: tts_client,
             system_instruction: system_instruction.to_string(),
             keywords: keywords,
+            conversation: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -55,6 +63,10 @@ impl GeminiClient {
                     "type": "string",
                     "description": "A natural language response."
                 },
+                "audio_transcript": {
+                    "type": "string",
+                    "description": "The faithful transcription of the latest user audio message."
+                },
                 "selected_keywords": {
                     "type": "array",
                     "description": "List of extracted or chosen keywords.",
@@ -63,7 +75,7 @@ impl GeminiClient {
                     }
                 }
             },
-            "required": ["text_response", "selected_keywords"],
+            "required": ["text_response", "selected_keywords", "audio_transcript"],
         });
 
         // 1. Create the Persona/Formatting instruction
@@ -71,6 +83,8 @@ impl GeminiClient {
             "You are a professional museum guide. \
             You answer questions based on the provided audio input and the information about the artist and art provided above. \
             Respond in JSON format according to the specified schema. \
+            Keep your answers concise and informative. \
+            First, transcribe the audio input faithfully. \
             You select keywords relevant to the question and your response from the provided list: {}. \
             Try to only refer to one keyword in each answer. If you are talking about the artist or the piece in general, select the option nothing.",
             self.keywords.join(", ")
@@ -84,15 +98,18 @@ impl GeminiClient {
         );
 
         let start_time = std::time::Instant::now();
-        let maybe_response = self
-            .client
-            .generate_content()
-            .with_system_instruction(combined_system_instruction)
-            .with_inline_data(audio_b4, audio_format)
-            .with_response_mime_type("application/json")
-            .with_response_schema(schema)
-            .execute()
-            .await;
+        let maybe_response = self.conversation.lock().unwrap().iter().fold(
+            self.client
+                .generate_content()
+                .with_system_instruction(combined_system_instruction)
+                .with_inline_data(audio_b4, audio_format)
+                .with_response_mime_type("application/json")
+                .with_response_schema(schema),
+            |call, exchange| {
+                call.with_user_message(&exchange.user_message)
+                    .with_model_message(&exchange.assistant_response)
+            },
+        ).execute().await;
 
         println!(
             "Gemini content generation request took: {:?}",
@@ -109,13 +126,22 @@ impl GeminiClient {
         let json_response: Value = serde_json::from_str(&response.text())?;
 
         let guide_response: String = json_response["text_response"].as_str().unwrap().to_string();
+        let user_question: String = json_response["audio_transcript"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        println!("User Question: {}", user_question);
+        println!("Guide Response: {}", guide_response);
+    
+        self.conversation.lock().unwrap().push(Exchange {
+            user_message: user_question,
+            assistant_response: guide_response.clone(),
+        });
 
         let tts_start_time = std::time::Instant::now();
         let audio_response = self.generate_speech(&guide_response).await?;
-        println!(
-            "generate_speech call took: {:?}",
-            tts_start_time.elapsed()
-        );
+        println!("generate_speech call took: {:?}", tts_start_time.elapsed());
 
         let selected_keywords: Vec<String> = json_response["selected_keywords"]
             .as_array()
@@ -157,10 +183,7 @@ impl GeminiClient {
             .with_generation_config(generation_config)
             .execute()
             .await;
-        println!(
-            "TTS generation request took: {:?}",
-            start_time.elapsed()
-        );
+        println!("TTS generation request took: {:?}", start_time.elapsed());
 
         match maybe {
             Ok(response) => {
