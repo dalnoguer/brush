@@ -96,7 +96,7 @@ pub(crate) async fn view_stream(
             .emit(ProcessMessage::CameraData {
                 focal_point: camera_info.focal_point,
                 focus_distance: camera_info.focus_distance,
-                rotation: Quat::from_rotation_y(std::f32::consts::PI),
+                rotation: Quat::from_rotation_x(-(std::f32::consts::FRAC_PI_2 + 0.5)),
             })
             .await;
     } else {

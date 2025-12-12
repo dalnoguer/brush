@@ -53,19 +53,9 @@ pub fn smooth_orbit(
     let delta_pitch = current_pitch - new_pitch;
     let pitch = Quat::from_axis_angle(rotation * Vec3::X, -delta_pitch);
 
-    let forward_proj = Vec3::new(forward.x, 0.0, forward.z).normalize();
-    let current_yaw = (-forward_proj.x).atan2(forward_proj.z);
-
-    let new_yaw = smooth_clamp(
-        current_yaw - delta_yaw,
-        clamping.min_yaw.map(|x| x.to_radians()),
-        clamping.max_yaw.map(|x| x.to_radians()),
-        dt,
-        50.0,
-    );
-
-    let delta_yaw = current_yaw - new_yaw;
-    let yaw = Quat::from_axis_angle(Vec3::NEG_Y, -delta_yaw);
+    // To orbit around the world's Z-axis (for a Z-up coordinate system),
+    // we use Vec3::Z as the axis for yaw rotation.
+    let yaw = Quat::from_axis_angle(Vec3::Z, -delta_yaw);
     let new_rotation = (yaw * pitch * rotation).normalize();
     let new_position = focal_point - new_rotation * Vec3::Z * distance;
 
