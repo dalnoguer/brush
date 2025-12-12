@@ -98,18 +98,28 @@ impl GeminiClient {
         );
 
         let start_time = std::time::Instant::now();
-        let maybe_response = self.conversation.lock().unwrap().iter().fold(
-            self.client
-                .generate_content()
-                .with_system_instruction(combined_system_instruction)
-                .with_inline_data(audio_b4, audio_format)
-                .with_response_mime_type("application/json")
-                .with_response_schema(schema),
+
+        // 1. Initialize the builder with system instructions and config (NO DATA YET)
+        let request_builder = self.client
+            .generate_content()
+            .with_system_instruction(combined_system_instruction)
+            .with_response_mime_type("application/json")
+            .with_response_schema(schema);
+
+        // 2. Append History (Oldest -> Newest)
+        let request_with_history = self.conversation.lock().unwrap().iter().fold(
+            request_builder,
             |call, exchange| {
                 call.with_user_message(&exchange.user_message)
                     .with_model_message(&exchange.assistant_response)
             },
-        ).execute().await;
+        );
+
+        // 3. Append Current Prompt (The Audio) LAST
+        let maybe_response = request_with_history
+            .with_inline_data(audio_b4, audio_format)
+            .execute()
+            .await;
 
         println!(
             "Gemini content generation request took: {:?}",
