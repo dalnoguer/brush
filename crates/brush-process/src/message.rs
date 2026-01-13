@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use brush_vfs::DataSource;
-use glam::Vec3;
+use glam::{Vec3, Quat};
 
 #[cfg(feature = "training")]
 use crate::config::TrainStreamConfig;
@@ -63,4 +63,9 @@ pub enum ProcessMessage {
     /// Splat, or dataset and initial splat, are done loading.
     #[allow(unused)]
     DoneLoading,
+    CameraData {
+        focal_point: Vec3,
+        focus_distance: f32,
+        rotation: Quat,
+    },
 }

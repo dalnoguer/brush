@@ -21,7 +21,7 @@ use brush_render::{
 };
 use eframe::egui_wgpu::Renderer;
 use egui::{Color32, Rect, Slider};
-use glam::{UVec2, Vec3};
+use glam::{Quat, UVec2, Vec3};
 use tracing::trace_span;
 use web_time::Instant;
 
@@ -939,6 +939,13 @@ impl AppPane for ScenePanel {
             }
             ProcessMessage::Warning { error } => {
                 self.warnings.push(ErrorDisplay::new(error));
+            }
+            ProcessMessage::CameraData {
+                focal_point,
+                focus_distance,
+                rotation,
+            } => {
+                process.set_focal_point(*focal_point, *focus_distance, *rotation);
             }
             _ => {}
         }

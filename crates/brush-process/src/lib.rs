@@ -4,6 +4,7 @@ use burn_wgpu::{
     RuntimeOptions, WgpuDevice,
     graphics::{AutoGraphicsApi, GraphicsApi},
 };
+use glam::{Vec3, Quat, EulerRot};
 use wgpu::{Adapter, Device, Queue};
 
 pub mod config;
@@ -181,7 +182,7 @@ pub fn create_process<
                         if guard.len() <= frame {
                             guard.resize(frame + 1, splats.clone());
                         }
-                        guard[frame] = splats;
+                        guard[frame] = splats.clone();
                     }
 
                     emitter
@@ -189,6 +190,34 @@ pub fn create_process<
                             up_axis: message.meta.up_axis,
                             frame: frame as u32,
                             total_frames,
+                        })
+                        .await;
+
+                    let means = splats.means.val();
+
+                    let min = means.clone().min_dim(0);
+                    let max = means.max_dim(0);
+
+                    let center = (min.clone().add(max.clone())).div_scalar(2.0);
+
+                    let center_data = center.clone().into_data();
+
+                    let extent = max.sub(center.clone());
+
+                    let radius = extent.powf_scalar(2.0).sum().sqrt().into_scalar();
+
+                    let center_slice = center_data
+                        .as_slice::<f32>()
+                        .expect("Tensor data should be f32");
+                    let focal_point = Vec3::from_slice(center_slice);
+
+                    let focus_distance = radius * 0.8;
+                    let rotation = Quat::from_euler(EulerRot::ZYX, std::f32::consts::PI, 0., -std::f32::consts::PI / 6.0);
+                    emitter
+                        .emit(ProcessMessage::CameraData {
+                            focal_point,
+                            focus_distance,
+                            rotation,
                         })
                         .await;
                 }
