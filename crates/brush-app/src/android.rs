@@ -1,3 +1,4 @@
+#![cfg(feature = "android-app")]
 use crate::shared::startup;
 use brush_ui::app::App;
 use brush_ui::ui_process::UiProcess;

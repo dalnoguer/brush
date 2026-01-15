@@ -5,7 +5,7 @@
 use brush_dataset::scene::SceneBatch;
 use brush_render::{
     AlphaMode, MainBackend,
-    bounding_box::BoundingBox,
+    bounding_box::{BoundingBox, BoundingSphere},
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
     validation::validate_splat_gradients,
@@ -171,6 +171,7 @@ fn test_training_step() {
         &config,
         &device,
         BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
     );
     let (final_splats, stats) = trainer.step(batch, splats);
 
@@ -200,6 +201,7 @@ fn test_multi_step_training() {
         &config,
         &device,
         BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
     );
     let _initial_count = splats.num_splats();
 

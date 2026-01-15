@@ -26,3 +26,18 @@ impl BoundingBox {
         extents[1] * 2.0
     }
 }
+
+#[derive(Clone, Copy)]
+pub struct BoundingSphere {
+    pub center: glam::Vec3,
+    pub radius: f32,
+}
+
+impl BoundingSphere {
+    pub fn from_center_and_radius(center: glam::Vec3, radius: f32) -> Self {
+        Self {
+            center,
+            radius
+        }
+    }
+}

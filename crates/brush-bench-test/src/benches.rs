@@ -251,7 +251,7 @@ mod backward_rendering {
 
 #[divan::bench_group(max_time = 4)]
 mod training {
-    use brush_render::bounding_box::BoundingBox;
+    use brush_render::bounding_box::{BoundingSphere, BoundingBox};
 
     use super::{
         Backend, MainBackend, SPLAT_COUNTS, SplatTrainer, TrainConfig, Vec3, WgpuDevice,
@@ -271,6 +271,7 @@ mod training {
                 &config,
                 &device,
                 BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+                BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
             );
 
             for step in 0..20 {

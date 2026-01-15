@@ -11,7 +11,10 @@ use crate::{
 
 use brush_dataset::scene::SceneBatch;
 use brush_render::{AlphaMode, MainBackend, gaussian_splats::Splats};
-use brush_render::{bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
+use brush_render::{
+    bounding_box::{BoundingBox, BoundingSphere},
+    sh::sh_coeffs_for_degree,
+};
 use brush_render_bwd::render_splats;
 use burn::{
     backend::{
@@ -53,6 +56,7 @@ pub struct SplatTrainer {
     bounds: BoundingBox,
     // #[cfg(not(target_family = "wasm"))]
     // lpips: Option<lpips::LpipsModel<DiffBackend>>,
+    bounding_sphere: BoundingSphere,
 }
 
 fn inv_sigmoid<B: Backend>(x: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -76,7 +80,12 @@ pub async fn get_splat_bounds<B: Backend>(splats: Splats<B>, percentile: f32) ->
 }
 
 impl SplatTrainer {
-    pub fn new(config: &TrainConfig, device: &WgpuDevice, bounds: BoundingBox) -> Self {
+    pub fn new(
+        config: &TrainConfig,
+        device: &WgpuDevice,
+        bounds: BoundingBox,
+        bounding_sphere: BoundingSphere,
+    ) -> Self {
         let decay = (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_steps as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
@@ -96,6 +105,7 @@ impl SplatTrainer {
             bounds,
             // #[cfg(not(target_family = "wasm"))]
             // lpips: (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device)),
+            bounding_sphere,
         }
     }
 
@@ -285,6 +295,42 @@ impl SplatTrainer {
         (splats, stats)
     }
 
+    pub async fn segment_sphere(&mut self, splats: Splats<MainBackend>) -> Splats<MainBackend> {
+        let device = splats.device();
+
+        let mut record = self
+            .optim
+            .take()
+            .expect("Can only segment after optimizer is initialized")
+            .to_record();
+
+        let center = self.bounding_sphere.center;
+        let center_tensor =
+            Tensor::<_, 1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
+
+        let dists_sq = (splats.means.val() - center_tensor)
+            .powi_scalar(2)
+            .sum_dim(1)
+            .squeeze_dim(1);
+
+        // Prune if distance > radius.
+        let radius = self.bounding_sphere.radius * self.config.attention_radius_multiplier;
+        let prune_mask = dists_sq.greater_elem(radius.powi(2));
+
+        let num_splats = splats.num_splats();
+        let refiner = self
+            .refine_record
+            .take()
+            .unwrap_or_else(|| RefineRecord::new(num_splats, &device));
+
+        let (splats, refiner, _) = prune_points(splats, &mut record, refiner, prune_mask).await;
+
+        self.refine_record = Some(refiner);
+        self.optim = Some(create_default_optimizer().load_record(record));
+
+        splats
+    }
+
     pub async fn refine(
         &mut self,
         iter: u32,
@@ -379,6 +425,266 @@ impl SplatTrainer {
                     .expect("Failed to read weights");
                 let growth_inds = multinomial_sample(&weights, grow_count);
                 split_inds.extend(growth_inds);
+            }
+        }
+
+        let refine_count = split_inds.len();
+        splats = self.refine_splats(&device, record, splats, split_inds, iter);
+
+        // Update current bounds based on the splats.
+        self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+        client.memory_cleanup();
+
+        (
+            splats,
+            RefineStats {
+                num_added: refine_count as u32,
+                num_pruned: pruned_count,
+            },
+        )
+    }
+
+    pub async fn refine_object_centric(
+        &mut self,
+        iter: u32,
+        splats: Splats<MainBackend>,
+    ) -> (Splats<MainBackend>, RefineStats) {
+        let device = splats.means.device();
+        let client = WgpuRuntime::client(&device);
+
+        let refiner = self
+            .refine_record
+            .take()
+            .expect("Can only refine if refine stats are initialized");
+
+        let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
+
+        // If not refining, update splat to step with gradients applied.
+        // Prune dead splats. This ALWAYS happen even if we're not "refining" anymore.
+        let mut record = self
+            .optim
+            .take()
+            .expect("Can only refine after optimizer is initialized")
+            .to_record();
+        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
+        let scales = splats.scales();
+
+        let scale_small = scales.clone().lower_elem(1e-10).any_dim(1).squeeze_dim(1);
+        let scale_big = scales
+            .greater_elem(max_allowed_bounds)
+            .any_dim(1)
+            .squeeze_dim(1);
+
+        // Remove splats that are way out of bounds.
+        let center = self.bounds.center;
+        let bound_center =
+            Tensor::<_, 1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
+        let splat_dists = (splats.means.val() - bound_center).abs();
+        let bound_mask = splat_dists
+            .greater_elem(max_allowed_bounds)
+            .any_dim(1)
+            .squeeze_dim(1);
+        let prune_mask = alpha_mask
+            .bool_or(scale_small)
+            .bool_or(scale_big)
+            .bool_or(bound_mask);
+
+        // --- 1. Perform Pruning ---
+        let (mut splats, refiner, pruned_count) =
+            prune_points(splats, &mut record, refiner, prune_mask).await;
+        let mut split_inds = HashSet::new();
+
+        // --- 2. Calculate Attention Masks & Budgets ---
+        let budget_ratio_inside = self.config.budget_ration_inside;
+        let max_splats_inside = (self.config.max_splats as f32 * budget_ratio_inside) as u32;
+        let max_splats_outside = self.config.max_splats - max_splats_inside;
+
+        // Calculate Spatial Mask (Inside vs Outside)
+        // We default to all "outside" if no attention sphere is defined.
+        let (attention_mask, is_inside_defined) = {
+            let center_tensor = Tensor::<_, 1>::from_floats(
+                [
+                    self.bounding_sphere.center.x,
+                    self.bounding_sphere.center.y,
+                    self.bounding_sphere.center.z,
+                ],
+                &device,
+            )
+            .reshape([1, 3]);
+            let dists_sq = (splats.means.val() - center_tensor)
+                .powi_scalar(2)
+                .sum_dim(1);
+
+            // Mask: 1 if inside, 0 if outside
+            (
+                dists_sq
+                    .lower_elem(
+                        (self.bounding_sphere.radius * self.config.attention_radius_multiplier)
+                            .powi(2),
+                    )
+                    .squeeze(),
+                true,
+            )
+        };
+
+        // Count current populations
+        let current_count_inside = attention_mask
+            .clone()
+            .int()
+            .sum()
+            .into_scalar_async()
+            .await
+            .unwrap_or(0) as u32;
+        let current_count_outside = splats.num_splats() - current_count_inside;
+
+        // Calculate available slots
+        let slots_available_inside = max_splats_inside.saturating_sub(current_count_inside);
+        let slots_available_outside = max_splats_outside.saturating_sub(current_count_outside);
+
+        // --- 3. Replace Dead Gaussians (Relocation) ---
+        // Strategy: We want to relocate dead splats into the sphere if there is room.
+        if pruned_count > 0 {
+            let vis_weights = splats.opacities() * refiner.vis_mask().float();
+
+            // Boost weights inside the sphere to encourage sampling there
+            // If we are over budget outside, we force the weights outside to zero.
+            let inside_boost = self.config.inside_sampling_weight_multiplier;
+
+            let mut weighted_mask = vis_weights;
+
+            if is_inside_defined {
+                let inside_float = attention_mask.clone().float();
+                let outside_float = attention_mask.clone().bool_not().float();
+
+                // 1. Boost inside weights
+                let boosted_inside = inside_float.clone().mul_scalar(inside_boost);
+
+                // 2. Clamp outside weights: If outside is full, zero them out.
+                let outside_factor = if slots_available_outside > 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                let clamped_outside = outside_float.mul_scalar(outside_factor);
+
+                // Combine: (Weights * Inside * 10) + (Weights * Outside * (1 or 0))
+                let modifier = boosted_inside.add(clamped_outside);
+                weighted_mask = weighted_mask * modifier;
+            }
+
+            let resampled_weights = weighted_mask
+                .into_data_async()
+                .await
+                .expect("Failed to get weights")
+                .into_vec::<f32>()
+                .expect("Failed to read weights");
+
+            // We only sample as many as we pruned, but the weights now direct them
+            // into the sphere or keep them outside based on availability.
+            let resampled_inds = multinomial_sample(&resampled_weights, pruned_count);
+            split_inds.extend(resampled_inds);
+        }
+
+        // --- 3.5 CORRECTION: Adjust Available Slots for Pending Relocations ---
+        // We have already committed to adding `split_inds.len()` splats in Step 3.
+        // We must subtract these from our available budget so we don't double-fill the space.
+        let pending_count = split_inds.len() as u32;
+
+        // We assume most relocations went Inside (due to the 20x weight boost).
+        // We deduct from Inside budget first to be safe/conservative regarding the object.
+        let slots_available_inside = slots_available_inside.saturating_sub(pending_count);
+
+        // If we had more relocations than inside slots, we deduct the remainder from outside.
+        let remainder =
+            pending_count.saturating_sub(max_splats_inside.saturating_sub(current_count_inside));
+        let slots_available_outside = slots_available_outside.saturating_sub(remainder);
+
+        // Safety Clamp: Ensure we never exceed global max, regardless of partition logic
+        let current_total = splats.num_splats();
+        let global_remaining = self
+            .config
+            .max_splats
+            .saturating_sub(current_total + pending_count);
+
+        // --- 4. Growth (Gradient Densification) ---
+        if iter < self.config.growth_stop_iter {
+            // Define Thresholds: Standard for inside, Stricter (2x) for outside
+            let thresh_in = self.config.growth_grad_threshold;
+            let thresh_out = self.config.growth_grad_threshold
+                * self.config.outside_gradient_threshold_multiplier;
+
+            // Get gradient masks
+            let high_grad_mask_in = refiner
+                .above_threshold(thresh_in)
+                .bool_and(attention_mask.clone());
+            let high_grad_mask_out = refiner
+                .above_threshold(thresh_out)
+                .bool_and(attention_mask.bool_not());
+
+            // Track how much we actually grow to ensure we stay within global limit
+            let mut used_growth_slots = 0;
+
+            // --- Growth for Inside ---
+            if slots_available_inside > 0 && used_growth_slots < global_remaining {
+                let candidates = high_grad_mask_in
+                    .clone()
+                    .int()
+                    .sum()
+                    .into_scalar_async()
+                    .await
+                    .unwrap_or(0) as u32;
+                if candidates > 0 {
+                    let grow_target =
+                        (candidates as f32 * self.config.growth_select_fraction).round() as u32;
+
+                    // Cap at: 1. Inside Budget, 2. Global Remaining
+                    let cap = slots_available_inside.min(global_remaining - used_growth_slots);
+                    let grow_count = grow_target.min(cap);
+
+                    if grow_count > 0 {
+                        let weights =
+                            high_grad_mask_in.float() * refiner.refine_weight_norm.clone();
+                        let weights_vec = weights
+                            .into_data_async()
+                            .await
+                            .unwrap()
+                            .into_vec::<f32>()
+                            .unwrap();
+                        split_inds.extend(multinomial_sample(&weights_vec, grow_count));
+                        used_growth_slots += grow_count;
+                    }
+                }
+            }
+
+            // --- Growth for Outside ---
+            if slots_available_outside > 0 && used_growth_slots < global_remaining {
+                let candidates = high_grad_mask_out
+                    .clone()
+                    .int()
+                    .sum()
+                    .into_scalar_async()
+                    .await
+                    .unwrap_or(0) as u32;
+                if candidates > 0 {
+                    let grow_target =
+                        (candidates as f32 * self.config.growth_select_fraction).round() as u32;
+
+                    // Cap at: 1. Outside Budget, 2. Global Remaining (after inside growth)
+                    let cap = slots_available_outside.min(global_remaining - used_growth_slots);
+                    let grow_count = grow_target.min(cap);
+
+                    if grow_count > 0 {
+                        let weights = high_grad_mask_out.float() * refiner.refine_weight_norm;
+                        let weights_vec = weights
+                            .into_data_async()
+                            .await
+                            .unwrap()
+                            .into_vec::<f32>()
+                            .unwrap();
+                        split_inds.extend(multinomial_sample(&weights_vec, grow_count));
+                        // used_growth_slots += grow_count; // Not strictly needed as it's the last step
+                    }
+                }
             }
         }
 

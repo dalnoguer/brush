@@ -22,6 +22,7 @@ default = ["training"]
 training = ["brush-cli/training", "brush-process/training", "brush-ui/training"]
 tracy = ["dep:tracing-subscriber", "dep:tracing-tracy"]
 debug-validation = ["brush-render/debug-validation", "brush-ui/debug-validation"]
+android-app = ["winit", "eframe"]
 
 [dependencies]
 # Brush deps.
@@ -36,7 +37,6 @@ tokio.workspace = true
 tokio-stream.workspace = true
 
 egui.workspace = true
-eframe.workspace = true
 
 anyhow.workspace = true
 tracing.workspace = true
@@ -46,23 +46,25 @@ tracing-subscriber = { workspace = true, optional = true }
 tracing-tracy = { workspace = true, optional = true }
 
 # On desktop platforms
-[target.'cfg(any(target_family = "unix", target_family = "windows"))'.dependencies]
+[target.'cfg(all(any(target_family = "unix", target_family = "windows"), not(target_os = "android")))'.dependencies]
 brush-cli.path = "../brush-cli"
 
 winit = { version = "0.30", features = ["default"] }
 clap.workspace = true
 env_logger.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt", "rt-multi-thread"] }
+eframe.workspace = true
 
 [target.'cfg(target_family = "windows")'.dependencies]
 winapi.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { version = "0.30", features = ["android-game-activity"] }
 rrfd.path = "../rrfd"
 tokio = { workspace = true, features = ["io-util", "rt", "rt-multi-thread"] }
 android_logger = "0.15.0"
 jni = "0.21.1"
+winit = { version = "0.30", features = ["android-game-activity"], optional = true }
+eframe = { workspace = true, optional = true }
 
 # On WASM
 [target.'cfg(target_family = "wasm")'.dependencies]

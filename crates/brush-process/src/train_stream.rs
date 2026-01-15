@@ -147,7 +147,15 @@ pub(crate) async fn train_stream(
     let mut train_duration = Duration::from_secs(0);
     let mut dataloader = SceneLoader::new(&dataset.train, 42);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
-    let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
+
+    let bounding_sphere =
+        dataset.train.get_bounding_sphere();
+    let mut trainer = SplatTrainer::new(
+        &train_stream_config.train_config,
+        &device,
+        bounds,
+        bounding_sphere,
+    );
 
     let export_path = if let Some(base_path) = vfs.base_path() {
         base_path.join("exports")
@@ -198,11 +206,17 @@ pub(crate) async fn train_stream(
             None
         };
 
-        let splats = splat_slot.get_main().unwrap();
-
         // We just finished iter 'iter', now starting iter + 1.
         let iter = iter + 1;
         let is_last_step = iter == train_stream_config.train_config.total_steps;
+
+        if is_last_step {
+            let splats = { splat_slot.write().remove(0) };
+            let splats = trainer.segment_sphere(splats).await;
+            *splat_slot.write() = vec![splats];
+        }
+
+        let splats = splat_slot.get_main().unwrap();
 
         // Add up time from this step.
         train_duration += step_time.elapsed();

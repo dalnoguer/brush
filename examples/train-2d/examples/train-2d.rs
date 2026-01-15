@@ -4,7 +4,7 @@
 use brush_dataset::scene::{SceneBatch, sample_to_tensor_data};
 use brush_render::{
     AlphaMode, MainBackend,
-    bounding_box::BoundingBox,
+    bounding_box::{BoundingBox, BoundingSphere},
     camera::{Camera, focal_to_fov, fov_to_focal},
     gaussian_splats::{SplatRenderMode, Splats},
     render_splats,
@@ -55,6 +55,7 @@ fn spawn_train_loop(
             &config,
             &device,
             BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+            BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
         );
 
         // One batch of training data, it's the same every step so can just construct it once.

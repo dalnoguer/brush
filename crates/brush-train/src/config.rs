@@ -4,7 +4,7 @@ use clap::Parser;
 #[derive(Clone, Parser)]
 pub struct TrainConfig {
     /// Total number of steps to train for.
-    #[arg(long, help_heading = "Training options", default_value = "30000")]
+    #[arg(long, help_heading = "Training options", default_value = "3000")]
     pub total_steps: u32,
 
     #[arg(long, help_heading = "Training options")]
@@ -47,16 +47,16 @@ pub struct TrainConfig {
     pub lr_rotation: f64,
 
     /// Max nr. of splats. This is an upper bound, but the actual final number of splats might be lower than this.
-    #[arg(long, help_heading = "Refine options", default_value = "10000000")]
+    #[arg(long, help_heading = "Refine options", default_value = "300000")]
     pub max_splats: u32,
 
     /// Frequency of 'refinement' where gaussians are replaced and densified. This should
     /// roughly be the number of images it takes to properly "cover" your scene.
-    #[arg(long, help_heading = "Refine options", default_value = "200")]
+    #[arg(long, help_heading = "Refine options", default_value = "50")]
     pub refine_every: u32,
 
     /// Threshold to control splat growth. Lower means faster growth.
-    #[arg(long, help_heading = "Refine options", default_value = "0.003")]
+    #[arg(long, help_heading = "Refine options", default_value = "0.0008")]
     pub growth_grad_threshold: f32,
 
     /// What fraction of splats that are deemed as needing to grow do actually grow.
@@ -65,8 +65,24 @@ pub struct TrainConfig {
     pub growth_select_fraction: f32,
 
     /// Period after which splat growth stops.
-    #[arg(long, help_heading = "Refine options", default_value = "15000")]
+    #[arg(long, help_heading = "Refine options", default_value = "2500")]
     pub growth_stop_iter: u32,
+
+    /// Attention radius multiplier.
+    #[arg(long, help_heading = "Attention radius multiplier", default_value = "0.8")]
+    pub attention_radius_multiplier: f32,
+
+    /// Budget ratio inside.
+    #[arg(long, help_heading = "Budget ratio inside", default_value = "0.95")]
+    pub budget_ration_inside: f32,
+
+    /// Inside sampling weight multiplier.
+    #[arg(long, help_heading = "Inside sampling weight multiplier", default_value = "20.0")]
+    pub inside_sampling_weight_multiplier: f32,
+
+    /// Outside gradient threshold multiplier.
+    #[arg(long, help_heading = "Outside gradient threshold multiplier", default_value = "4.0")]
+    pub outside_gradient_threshold_multiplier: f32,
 
     /// Weight of SSIM loss (compared to l1 loss)
     #[clap(long, help_heading = "Training options", default_value = "0.2")]
