@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "kebab-case")]
 pub struct TrainConfig {
     /// Total number of steps to train for.
-    #[arg(long, help_heading = "Training options", default_value = "30000")]
+    #[arg(long, help_heading = "Training options", default_value = "1000")]
     pub total_steps: u32,
 
     #[arg(long, help_heading = "Training options")]
     pub render_mode: Option<SplatRenderMode>,
 
     /// Start learning rate for the mean parameters.
-    #[arg(long, help_heading = "Training options", default_value = "2e-5")]
+    #[arg(long, help_heading = "Training options", default_value = "2e-4")]
     pub lr_mean: f64,
 
     /// Start learning rate for the mean parameters.
@@ -25,7 +25,7 @@ pub struct TrainConfig {
     pub mean_noise_weight: f32,
 
     /// Learning rate for the base SH (RGB) coefficients.
-    #[arg(long, help_heading = "Training options", default_value = "2e-3")]
+    #[arg(long, help_heading = "Training options", default_value = "1e-2")]
     pub lr_coeffs_dc: f64,
 
     /// How much to divide the learning rate by for higher SH orders.
@@ -33,11 +33,11 @@ pub struct TrainConfig {
     pub lr_coeffs_sh_scale: f32,
 
     /// Learning rate for the opacity parameter.
-    #[arg(long, help_heading = "Training options", default_value = "0.012")]
+    #[arg(long, help_heading = "Training options", default_value = "0.06")]
     pub lr_opac: f64,
 
     /// Learning rate for the scale parameters.
-    #[arg(long, help_heading = "Training options", default_value = "7e-3")]
+    #[arg(long, help_heading = "Training options", default_value = "3.5e-2")]
     pub lr_scale: f64,
 
     /// Learning rate for the scale parameters.
@@ -45,16 +45,16 @@ pub struct TrainConfig {
     pub lr_scale_end: f64,
 
     /// Learning rate for the rotation parameters.
-    #[arg(long, help_heading = "Training options", default_value = "2e-3")]
+    #[arg(long, help_heading = "Training options", default_value = "1e-2")]
     pub lr_rotation: f64,
 
     /// Max nr. of splats. This is an upper bound, but the actual final number of splats might be lower than this.
-    #[arg(long, help_heading = "Refine options", default_value = "10000000")]
+    #[arg(long, help_heading = "Refine options", default_value = "1000000")]
     pub max_splats: u32,
 
     /// Frequency of 'refinement' where gaussians are replaced and densified. This should
     /// roughly be the number of images it takes to properly "cover" your scene.
-    #[arg(long, help_heading = "Refine options", default_value = "200")]
+    #[arg(long, help_heading = "Refine options", default_value = "25")]
     pub refine_every: u32,
 
     /// Threshold to control splat growth. Lower means faster growth.
@@ -67,7 +67,7 @@ pub struct TrainConfig {
     pub growth_select_fraction: f32,
 
     /// Period after which splat growth stops.
-    #[arg(long, help_heading = "Refine options", default_value = "15000")]
+    #[arg(long, help_heading = "Refine options", default_value = "800")]
     pub growth_stop_iter: u32,
 
     /// Weight of SSIM loss (compared to l1 loss)
