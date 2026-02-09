@@ -5,7 +5,7 @@
 use brush_dataset::scene::SceneBatch;
 use brush_render::{
     AlphaMode, MainBackend,
-    bounding_box::BoundingBox,
+    bounding_box::{BoundingBox, BoundingSphere},
     camera::Camera,
     gaussian_splats::{SplatRenderMode, Splats},
     validation::validate_splat_gradients,
@@ -171,8 +171,13 @@ async fn test_training_step() {
         &config,
         &device,
         BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
     );
+<<<<<<< Updated upstream
     let (final_splats, stats) = trainer.step(batch, splats).await;
+=======
+    let (final_splats, stats) = trainer.step(batch, splats, 0);
+>>>>>>> Stashed changes
 
     assert!(final_splats.num_splats() > 0);
     let loss = stats.loss.into_scalar();
@@ -200,12 +205,18 @@ async fn test_multi_step_training() {
         &config,
         &device,
         BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+        BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
     );
     let _initial_count = splats.num_splats();
 
     // Run a few training steps
+<<<<<<< Updated upstream
     for _ in 0..3 {
         let (new_splats, stats) = trainer.step(batch.clone(), splats).await;
+=======
+    for step in 0..3 {
+        let (new_splats, stats) = trainer.step(batch.clone(), splats, step);
+>>>>>>> Stashed changes
         splats = new_splats;
 
         let loss = stats.loss.into_scalar();

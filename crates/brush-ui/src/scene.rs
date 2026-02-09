@@ -792,6 +792,13 @@ impl AppPane for ScenePanel {
             ProcessMessage::Warning { error } => {
                 self.warnings.push(ErrorDisplay::new(error));
             }
+            ProcessMessage::CameraData {
+                focal_point,
+                focus_distance,
+                rotation,
+            } => {
+                process.set_focal_point(*focal_point, *focus_distance, *rotation);
+            }
             _ => {}
         }
     }

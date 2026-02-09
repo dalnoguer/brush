@@ -8,7 +8,7 @@ pub mod train;
 
 mod adam_scaled;
 mod quat_vec;
-mod ssim;
+pub mod ssim;
 mod stats;
 
 mod splat_init;

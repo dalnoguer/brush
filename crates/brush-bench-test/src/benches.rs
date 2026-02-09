@@ -281,8 +281,12 @@ mod backward_rendering {
 
 #[divan::bench_group(max_time = 4)]
 mod training {
+<<<<<<< Updated upstream
     use brush_render::bounding_box::BoundingBox;
     use burn_cubecl::cubecl::future::block_on;
+=======
+    use brush_render::bounding_box::{BoundingSphere, BoundingBox};
+>>>>>>> Stashed changes
 
     use crate::benches::ITERS_PER_SYNC;
 
@@ -293,6 +297,7 @@ mod training {
 
     #[divan::bench(args = SPLAT_COUNTS)]
     fn train_steps(splat_count: usize) {
+<<<<<<< Updated upstream
         let device = WgpuDevice::default();
         let batch1 = generate_training_batch((1920, 1080), Vec3::new(0.0, 0.0, 5.0));
         let batch2 = generate_training_batch((1920, 1080), Vec3::new(2.0, 0.0, 5.0));
@@ -310,6 +315,28 @@ mod training {
             splats = new_splats;
         }
         MainBackend::sync(&device).expect("Failed to sync");
+=======
+        burn_cubecl::cubecl::future::block_on(async {
+            let device = WgpuDevice::default();
+            let batch1 = generate_training_batch((1920, 1080), Vec3::new(0.0, 0.0, 5.0));
+            let batch2 = generate_training_batch((1920, 1080), Vec3::new(2.0, 0.0, 5.0));
+            let batches = [batch1, batch2];
+            let config = TrainConfig::default();
+            let mut splats = gen_splats(&device, splat_count);
+            let mut trainer = SplatTrainer::new(
+                &config,
+                &device,
+                BoundingBox::from_min_max(Vec3::ZERO, Vec3::ONE),
+                BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.0)
+            );
+            for step in 0..ITERS_PER_SYNC {
+                let batch = batches[step as usize % batches.len()].clone();
+                let (new_splats, _) = trainer.step(batch, splats, step);
+                splats = new_splats;
+            }
+            MainBackend::sync(&device).expect("Failed to sync");
+        });
+>>>>>>> Stashed changes
     }
 }
 

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use brush_vfs::DataSource;
-use glam::Vec3;
+use glam::{Vec3, Quat};
 
 #[cfg(feature = "training")]
 use crate::config::TrainStreamConfig;
@@ -58,6 +58,11 @@ pub enum ProcessMessage {
         num_splats: u32,
         sh_degree: u32,
     },
+    VisualizationUpdated {
+        image: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
     #[cfg(feature = "training")]
     TrainMessage(TrainMessage),
     /// Some warning occurred during the process, but the process can continue.
@@ -65,4 +70,9 @@ pub enum ProcessMessage {
     /// Splat, or dataset and initial splat, are done loading.
     #[allow(unused)]
     DoneLoading,
+    CameraData {
+        focal_point: Vec3,
+        focus_distance: f32,
+        rotation: Quat,
+    },
 }

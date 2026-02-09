@@ -3,8 +3,10 @@ use brush_process::config::TrainStreamConfig;
 use brush_process::message::TrainMessage;
 use brush_process::{create_process, message::ProcessMessage};
 use brush_vfs::DataSource;
+use log::error;
 use std::convert::TryFrom;
 use std::ffi::{CStr, c_char, c_void};
+use std::panic;
 use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 
@@ -21,18 +23,35 @@ pub enum ProgressMessage {
     NewProcess,
     Training { iter: u32 },
     DoneTraining,
+    VisualizationUpdated {
+        data: *const u8,
+        len: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
-impl TryFrom<ProcessMessage> for ProgressMessage {
+impl TryFrom<&ProcessMessage> for ProgressMessage {
     type Error = ();
 
-    fn try_from(value: ProcessMessage) -> Result<Self, Self::Error> {
+    fn try_from(value: &ProcessMessage) -> Result<Self, Self::Error> {
         match value {
             ProcessMessage::NewProcess => Ok(Self::NewProcess),
             ProcessMessage::TrainMessage(TrainMessage::TrainStep { iter, .. }) => {
-                Ok(Self::Training { iter })
+                Ok(Self::Training { iter: *iter })
             }
             ProcessMessage::TrainMessage(TrainMessage::DoneTraining) => Ok(Self::DoneTraining),
+            
+            // Map the Rust Vec to raw pointers for C#
+            ProcessMessage::VisualizationUpdated { image, width, height } => {
+                Ok(Self::VisualizationUpdated {
+                    data: image.as_ptr(),
+                    len: image.len() as u32,
+                    width: *width,
+                    height: *height,
+                })
+            }
+            
             _ => Err(()),
         }
     }
@@ -77,35 +96,60 @@ pub type ProgressCallback =
 
 static SETUP: OnceCell<()> = OnceCell::const_new();
 
-/// Trains a model from a dataset and saves the result.
-///
-/// This function is designed to be called from other languages via FFI. It will
-/// block the current thread until training is complete.
-///
-/// # Arguments
-///
-/// * `dataset_path` - A pointer to a null-terminated C string representing the path to the dataset.
-/// * `options` - A pointer to a `TrainOptions` struct.
-/// * `progress_callback` - A callback function that will be invoked with progress updates.
-/// * `user_data` - An opaque pointer passed to the `progress_callback`.
-///
-/// # Safety
-///
-/// The caller must uphold several invariants. Passing `null` for `dataset_path` or `options`
-/// is safe and will result in an error code, but if they are non-null, they must be valid.
-///
-/// - If `dataset_path` is not null, it must point to a valid, null-terminated C string. The
-///   memory it points to must be valid for reading for the duration of this call.
-///
-/// - If `options` is not null, it must point to a valid `TrainOptions` struct. The memory it
-///   points to must be valid for reading for the duration of this call. It's `output_path` must
-///   be a valid, null-terminated C string if not null.
-///
-/// - The `user_data` pointer is passed to `progress_callback` but is not dereferenced by this
-///   function. If it is not null, the caller must ensure it points to memory that remains
-///   valid for the entire duration of this function call, as the callback may dereference it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn train_and_save(
+    dataset_path: *const c_char,
+    options: *const TrainOptions,
+    progress_callback: ProgressCallback,
+    user_data: *mut c_void,
+) -> TrainExitCode {
+    #[cfg(target_os = "android")]
+    {
+        // 1. Initialize Logger
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Error)
+                .with_tag("RustLayer"),
+        );
+
+        // 2. REGISTER PANIC HOOK
+        // This catches the panic info and logs it to Logcat before the app aborts.
+        panic::set_hook(Box::new(|panic_info| {
+            let (file, line) = match panic_info.location() {
+                Some(loc) => (loc.file(), loc.line()),
+                None => ("unknown", 0),
+            };
+
+            let msg = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+                *s
+            } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+                &**s
+            } else {
+                "Box<Any>"
+            };
+
+            // Log with "Fatal" priority so it stands out
+            error!("RUST PANIC at {}:{}: {}", file, line, msg);
+        }));
+    }
+
+    // Wrap the logic in catch_unwind to prevent unwinding across FFI boundary
+    // (If you use panic="abort" in Cargo.toml, this won't catch it,
+    // but the hook above WILL still log it).
+    let result = panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        run_training_logic(dataset_path, options, progress_callback, user_data)
+    }));
+
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            error!("Rust panicked and was caught at FFI boundary.");
+            TrainExitCode::Error
+        }
+    }
+}
+
+unsafe fn run_training_logic(
     dataset_path: *const c_char,
     options: *const TrainOptions,
     progress_callback: ProgressCallback,
@@ -115,16 +159,11 @@ pub unsafe extern "C" fn train_and_save(
         return TrainExitCode::Error;
     }
 
-    let dataset_path_str =
-        // SAFETY: Checked if dataset_path is not null, caller guarantees the string is a valid C-string.
-        unsafe { CStr::from_ptr(dataset_path).to_string_lossy().into_owned() };
-
+    let dataset_path_str = unsafe { CStr::from_ptr(dataset_path).to_string_lossy().into_owned() };
     let source = DataSource::Path(dataset_path_str);
-
-    // SAFETY: Option is checked to not be null before the future.
     let train_options = unsafe { *options };
-    // SAFETY: Caller guarantees the output_path is a valid C-string if not null.
     let process_args = unsafe { train_options.into_train_stream_config() };
+
     let mut process = create_process(source, async move |_| process_args);
 
     tokio::runtime::Builder::new_current_thread()
@@ -142,7 +181,7 @@ pub unsafe extern "C" fn train_and_save(
             while let Some(message_result) = process.stream.next().await {
                 match message_result {
                     Ok(message) => {
-                        if let Ok(progress_message) = message.try_into() {
+                        if let Ok(progress_message) = (&message).try_into() {
                             progress_callback(progress_message, user_data);
                         }
                     }

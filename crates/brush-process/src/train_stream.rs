@@ -8,7 +8,8 @@ use async_fn_stream::TryStreamEmitter;
 use brush_dataset::{load_dataset, scene::Scene, scene_loader::SceneLoader};
 use brush_render::{
     MainBackend,
-    gaussian_splats::{SplatRenderMode, Splats},
+    gaussian_splats::{SplatRenderMode, Splats, TextureMode},
+    render_splats,
 };
 use brush_rerun::visualize_tools::VisualizeTools;
 use brush_train::{
@@ -23,6 +24,7 @@ use brush_vfs::BrushVfs;
 use burn::{module::AutodiffModule, prelude::Backend};
 use burn_cubecl::cubecl::Runtime;
 use burn_wgpu::{WgpuDevice, WgpuRuntime};
+use glam::{EulerRot, Quat, Vec3};
 use rand::SeedableRng;
 use std::{path::PathBuf, sync::Arc};
 
@@ -105,7 +107,7 @@ pub(crate) async fn train_stream(
             .train_config
             .render_mode
             .or(msg.meta.render_mode)
-            .unwrap_or(SplatRenderMode::Default);
+            .unwrap_or(SplatRenderMode::Mip);
         let splats = to_init_splats(msg.data, render_mode, &device);
         (msg.meta.up_axis, splats)
     } else {
@@ -113,7 +115,7 @@ pub(crate) async fn train_stream(
         let render_mode = train_stream_config
             .train_config
             .render_mode
-            .unwrap_or(SplatRenderMode::Default);
+            .unwrap_or(SplatRenderMode::Mip);
         log::info!("Starting with random splat config.");
         // Create a bounding box the size of all the cameras plus a bit.
         let mut bounds = dataset.train.bounds();
@@ -150,7 +152,14 @@ pub(crate) async fn train_stream(
     let mut train_duration = Duration::from_secs(0);
     let mut dataloader = SceneLoader::new(&dataset.train, 42);
     let bounds = get_splat_bounds(init_splats.clone(), BOUND_PERCENTILE).await;
-    let mut trainer = SplatTrainer::new(&train_stream_config.train_config, &device, bounds);
+
+    let bounding_sphere = dataset.train.get_bounding_sphere();
+    let mut trainer = SplatTrainer::new(
+        &train_stream_config.train_config,
+        &device,
+        bounds,
+        bounding_sphere,
+    );
 
     // Get the dataset name from the base path (if available) for interpolation.
     let dataset_name = vfs
@@ -179,6 +188,40 @@ pub(crate) async fn train_stream(
     for iter in
         train_stream_config.process_config.start_iter..train_stream_config.train_config.total_steps
     {
+        if iter.is_multiple_of(50) {
+            let view = &dataset.train.views[0];
+            let splats = splat_slot.clone_main().await.unwrap();
+
+            let img_size = glam::uvec2(540, 540);
+            let orig_size = glam::uvec2(540, 960);
+
+            let mut camera = view.camera.clone();
+
+            let scale_x = img_size.x as f64 / orig_size.x as f64;
+            let scale_y = img_size.y as f64 / orig_size.y as f64;
+
+            camera.fov_x *= scale_x;
+            camera.fov_y *= scale_y;
+
+            let (img, _aux) = render_splats(
+                splats,
+                &camera,
+                img_size,
+                Vec3::ZERO,
+                None,
+                TextureMode::Packed,
+            )
+            .await;
+            let byte_data: Vec<u8> = img.into_data().bytes.to_vec();
+            emitter
+                .emit(ProcessMessage::VisualizationUpdated {
+                    width: img_size[0],
+                    height: img_size[1],
+                    image: byte_data,
+                })
+                .await;
+        }
+
         let step_time = Instant::now();
 
         // Wait for next batch.
@@ -189,7 +232,9 @@ pub(crate) async fn train_stream(
 
         let stats = splat_slot
             .act(0, |splats| async {
-                let (new_splats, stats) = trainer.step(batch, splats_into_autodiff(splats)).await;
+                let (new_splats, stats) = trainer
+                    .step(batch, splats_into_autodiff(splats), iter)
+                    .await;
                 (new_splats.valid(), stats)
             })
             .await
@@ -224,7 +269,10 @@ pub(crate) async fn train_stream(
                         train_stream_config.train_config.high_error_threshold,
                     )
                     .await;
-                    trainer.refine_final(splats.clone(), gaussian_scores).await
+                    let segment_sphere = iter == 900;
+                    trainer
+                        .refine_final(splats.clone(), gaussian_scores, segment_sphere)
+                        .await
                 })
                 .await
                 .unwrap()
@@ -347,6 +395,37 @@ pub(crate) async fn train_stream(
                 .await;
         }
     }
+
+    // let focus_distance = radius * 0.8;
+    let focal_point = trainer.bounding_sphere.center;
+    let focus_distance = trainer.bounding_sphere.radius;
+    let rotation = Quat::from_euler(
+        EulerRot::ZYX,
+        std::f32::consts::PI,
+        0.,
+        -std::f32::consts::PI / 6.0,
+    );
+    let splats = splat_slot.clone_main().await.unwrap();
+    let num_splats = splats.num_splats();
+    let sh_degree = splats.sh_degree();
+
+    emitter
+        .emit(ProcessMessage::CameraData {
+            focal_point,
+            focus_distance,
+            rotation,
+        })
+        .await;
+
+    emitter
+        .emit(ProcessMessage::SplatsUpdated {
+            up_axis: Some(Vec3::new(0.0, -1.0, 0.0)),
+            frame: 1,
+            total_frames: 1,
+            num_splats: num_splats,
+            sh_degree: sh_degree,
+        })
+        .await;
 
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::DoneTraining))

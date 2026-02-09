@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 // Platform-specific modules.
-#[cfg(target_os = "android")]
+#[cfg(all(target_os = "android", feature = "ui"))]
 mod android;
 #[cfg(target_family = "wasm")]
 pub mod wasm;

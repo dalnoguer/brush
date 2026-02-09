@@ -93,3 +93,49 @@ pub fn validate_splat_gradients<B>(
         validate_gradient_finite(&opacity_grad, "raw_opacity");
     }
 }
+
+pub fn print_tensor_stats<B: Backend>(tensor: &Tensor<B, 1>, name: &str) {
+    let mean_tensor = tensor.clone().mean();
+    let var_tensor = tensor.clone().var(0);
+    let std_tensor = var_tensor.sqrt();
+
+    let to_f32 = |t: Tensor<B, 1>| -> f32 {
+        t.into_data().convert::<f32>().to_vec::<f32>().unwrap()[0]
+    };
+
+    let mean_val = to_f32(mean_tensor);
+    let std_val = to_f32(std_tensor);
+
+    let data = tensor.to_data();
+    let mut values = data.convert::<f32>().to_vec::<f32>().unwrap();
+
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    if values.is_empty() {
+        println!("Tensor '{}' is empty.", name);
+        return;
+    }
+
+    let len = values.len();
+    let min = values[0];
+    let max = values[len - 1];
+    let median = values[len / 2];
+
+    let p90_idx = ((len as f32) * 0.90) as usize;
+    let p90 = values[p90_idx.min(len - 1)];
+    
+    let p99_idx = ((len as f32) * 0.99) as usize;
+    let p99 = values[p99_idx.min(len - 1)];
+
+    println!("--- Statistics for '{}' ---", name);
+    println!("Shape:      {:?}", tensor.shape());
+    println!("Count:      {}", len);
+    println!("Mean:       {:.4}", mean_val);
+    println!("Std Dev:    {:.4}", std_val);
+    println!("Min:        {:.4}", min);
+    println!("Median:     {:.4}", median);
+    println!("P90:        {:.4}", p90);
+    println!("P99:        {:.4}", p99);
+    println!("Max:        {:.4}", max);
+    println!("----------------------------");
+}

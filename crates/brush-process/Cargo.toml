@@ -21,6 +21,7 @@ burn-wgpu.workspace = true
 
 alphanumeric-sort.workspace = true
 anyhow.workspace = true
+bytemuck.workspace = true
 async-fn-stream.workspace = true
 
 clap.workspace = true

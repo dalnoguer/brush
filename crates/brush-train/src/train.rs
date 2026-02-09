@@ -11,7 +11,10 @@ use crate::{
 
 use brush_dataset::scene::SceneBatch;
 use brush_render::{AlphaMode, MainBackend, gaussian_splats::Splats};
-use brush_render::{bounding_box::BoundingBox, sh::sh_coeffs_for_degree};
+use brush_render::{
+    bounding_box::{BoundingBox, BoundingSphere},
+    sh::sh_coeffs_for_degree,
+};
 use brush_render_bwd::render_splats;
 use burn::{
     backend::{
@@ -53,6 +56,7 @@ pub struct SplatTrainer {
     bounds: BoundingBox,
     // #[cfg(not(target_family = "wasm"))]
     // lpips: Option<lpips::LpipsModel<DiffBackend>>,
+    pub bounding_sphere: BoundingSphere,
 }
 
 fn inv_sigmoid<B: Backend>(x: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -76,7 +80,12 @@ pub async fn get_splat_bounds<B: Backend>(splats: Splats<B>, percentile: f32) ->
 }
 
 impl SplatTrainer {
-    pub fn new(config: &TrainConfig, device: &WgpuDevice, bounds: BoundingBox) -> Self {
+    pub fn new(
+        config: &TrainConfig,
+        device: &WgpuDevice,
+        bounds: BoundingBox,
+        bounding_sphere: BoundingSphere,
+    ) -> Self {
         let decay = (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_steps as f64);
         let lr_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay);
 
@@ -96,6 +105,7 @@ impl SplatTrainer {
             bounds,
             // #[cfg(not(target_family = "wasm"))]
             // lpips: (config.lpips_loss_weight > 0.0).then(|| lpips::load_vgg_lpips(device)),
+            bounding_sphere,
         }
     }
 
@@ -103,6 +113,7 @@ impl SplatTrainer {
         &mut self,
         batch: SceneBatch,
         splats: Splats<DiffBackend>,
+        iter: u32,
     ) -> (Splats<DiffBackend>, TrainStepStats<MainBackend>) {
         let mut splats = splats;
 
@@ -200,25 +211,27 @@ impl SplatTrainer {
         });
 
         splats = trace_span!("Optimizer step").in_scope(|| {
+            if iter < 900 {
+                splats = trace_span!("Rotation step").in_scope(|| {
+                    let grad_rot =
+                        GradientsParams::from_params(&mut grads, &splats, &[splats.rotations.id]);
+                    optimizer.step(lr_rotation, splats, grad_rot)
+                });
+                splats = trace_span!("Scale step").in_scope(|| {
+                    let grad_scale =
+                        GradientsParams::from_params(&mut grads, &splats, &[splats.log_scales.id]);
+                    optimizer.step(lr_scale, splats, grad_scale)
+                });
+                splats = trace_span!("Mean step").in_scope(|| {
+                    let grad_means =
+                        GradientsParams::from_params(&mut grads, &splats, &[splats.means.id]);
+                    optimizer.step(lr_mean, splats, grad_means)
+                });
+            }
             splats = trace_span!("SH Coeffs step").in_scope(|| {
                 let grad_coeff =
                     GradientsParams::from_params(&mut grads, &splats, &[splats.sh_coeffs.id]);
                 optimizer.step(lr_coeffs, splats, grad_coeff)
-            });
-            splats = trace_span!("Rotation step").in_scope(|| {
-                let grad_rot =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.rotations.id]);
-                optimizer.step(lr_rotation, splats, grad_rot)
-            });
-            splats = trace_span!("Scale step").in_scope(|| {
-                let grad_scale =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.log_scales.id]);
-                optimizer.step(lr_scale, splats, grad_scale)
-            });
-            splats = trace_span!("Mean step").in_scope(|| {
-                let grad_means =
-                    GradientsParams::from_params(&mut grads, &splats, &[splats.means.id]);
-                optimizer.step(lr_mean, splats, grad_means)
             });
             splats = trace_span!("Opacity step").in_scope(|| {
                 let grad_opac =
@@ -384,6 +397,7 @@ impl SplatTrainer {
         &mut self,
         splats: Splats<MainBackend>,
         gaussian_scores: GaussianScores<MainBackend>,
+        segment_sphere: bool,
     ) -> (Splats<MainBackend>, RefineStats) {
         let device = splats.means.device();
 
@@ -414,12 +428,29 @@ impl SplatTrainer {
             .clone()
             .greater_elem(self.config.final_max_pruning_score);
 
-        let prune_mask = alpha_mask
+        let mut prune_mask = alpha_mask
             .clone()
             .bool_or(scale_small)
             .bool_or(scale_big)
             .bool_or(bound_mask)
             .bool_or(high_error_mask);
+
+        if segment_sphere {
+            let center = self.bounding_sphere.center;
+            let center_tensor =
+                Tensor::<_, 1>::from_floats([center.x, center.y, center.z], &device)
+                    .reshape([1, 3]);
+
+            let dists_sq = (splats.means.val() - center_tensor)
+                .powi_scalar(2)
+                .sum_dim(1)
+                .squeeze_dim(1);
+
+            // Prune if distance > radius.
+            let radius = self.bounding_sphere.radius * self.config.attention_radius_multiplier;
+            let sphere_mask = dists_sq.greater_elem(radius.powi(2));
+            prune_mask = prune_mask.bool_or(sphere_mask);
+        }
 
         let mut record = self
             .optim
@@ -440,6 +471,176 @@ impl SplatTrainer {
                 num_added: 0,
                 num_pruned: pruned_count,
                 total_splats: splat_count,
+            },
+        )
+    }
+
+    pub async fn refine_object_centric(
+        &mut self,
+        iter: u32,
+        splats: Splats<MainBackend>,
+        gaussian_scores: GaussianScores<MainBackend>,
+    ) -> (Splats<MainBackend>, RefineStats) {
+        let device = splats.means.device();
+        let client = WgpuRuntime::client(&device);
+
+        let refiner = self
+            .refine_record
+            .take()
+            .expect("Can only refine if refine stats are initialized");
+
+        let max_allowed_bounds = self.bounds.extent.max_element() * 100.0;
+
+        let mut record = self
+            .optim
+            .take()
+            .expect("Can only refine after optimizer is initialized")
+            .to_record();
+
+        // Remove splats that are too transparent, big, small or out of bounds.
+        let alpha_mask = splats.opacities().lower_elem(MIN_OPACITY);
+        let scales = splats.scales();
+
+        let scale_small = scales.clone().lower_elem(1e-10).any_dim(1).squeeze_dim(1);
+        let scale_big = scales
+            .greater_elem(max_allowed_bounds)
+            .any_dim(1)
+            .squeeze_dim(1);
+
+        let center = self.bounds.center;
+        let bound_center =
+            Tensor::<_, 1>::from_floats([center.x, center.y, center.z], &device).reshape([1, 3]);
+        let splat_dists = (splats.means.val() - bound_center).abs();
+        let bound_mask = splat_dists
+            .greater_elem(max_allowed_bounds)
+            .any_dim(1)
+            .squeeze_dim(1);
+        let prune_mask = alpha_mask
+            .bool_or(scale_small)
+            .bool_or(scale_big)
+            .bool_or(bound_mask);
+
+        let (mut splats, refiner, pruned_count) =
+            prune_points(splats, &mut record, refiner, prune_mask.clone()).await;
+
+        let keep_mask = prune_mask.bool_not().argwhere().squeeze();
+        let importance_score = gaussian_scores.importance_score.select(0, keep_mask);
+
+        // Compute mask (inside/outside) for object centric densification
+        let (attention_mask, _) = {
+            let center_tensor = Tensor::<_, 1>::from_floats(
+                [
+                    self.bounding_sphere.center.x,
+                    self.bounding_sphere.center.y,
+                    self.bounding_sphere.center.z,
+                ],
+                &device,
+            )
+            .reshape([1, 3]);
+            let dists_sq = (splats.means.val() - center_tensor)
+                .powi_scalar(2)
+                .sum_dim(1);
+
+            (
+                dists_sq
+                    .lower_elem(
+                        (self.bounding_sphere.radius * self.config.attention_radius_multiplier)
+                            .powi(2),
+                    )
+                    .squeeze::<1>(),
+                true,
+            )
+        };
+
+        // Calcualte quota for inside/outside
+        let budget_ratio_inside = self.config.budget_ration_inside;
+        let max_splats_inside = (self.config.max_splats as f32 * budget_ratio_inside) as u32;
+        let max_splats_outside = self.config.max_splats - max_splats_inside;
+
+        let current_count_inside = attention_mask
+            .clone()
+            .int()
+            .sum()
+            .into_scalar_async()
+            .await
+            .unwrap_or(0) as u32;
+        let current_count_outside = splats.num_splats() - current_count_inside;
+
+        let slots_available_inside = max_splats_inside.saturating_sub(current_count_inside);
+        let slots_available_outside = max_splats_outside.saturating_sub(current_count_outside);
+
+        let mut split_inds = HashSet::new();
+
+        // Split splats that have a high gradient and importance score
+        let above_threshold = refiner.above_threshold(self.config.growth_grad_threshold);
+        let above_importance_score =
+            importance_score.greater_elem(self.config.min_importance_score);
+        let to_split = above_threshold.bool_and(above_importance_score);
+
+        let split_mask_data = to_split
+            .into_data_async()
+            .await
+            .expect("Failed to download split mask")
+            .into_vec::<u32>()
+            .expect("Failed to read split mask");
+
+        let attention_mask_data = attention_mask
+            .into_data_async()
+            .await
+            .expect("Failed to download attention mask")
+            .into_vec::<u32>()
+            .expect("Failed to read attention mask");
+
+        // Separate candidates
+        let mut candidates_in: Vec<i32> = Vec::new();
+        let mut candidates_out: Vec<i32> = Vec::new();
+
+        for (idx, &is_candidate) in split_mask_data.iter().enumerate() {
+            if is_candidate > 0 {
+                let is_inside = attention_mask_data[idx] > 0;
+                if is_inside {
+                    candidates_in.push(idx as i32);
+                } else {
+                    candidates_out.push(idx as i32);
+                }
+            }
+        }
+
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+
+        // Process Inside Budget
+        if !candidates_in.is_empty() && slots_available_inside > 0 {
+            candidates_in.shuffle(&mut rng);
+            if candidates_in.len() > slots_available_inside as usize {
+                candidates_in.truncate(slots_available_inside as usize);
+            }
+            split_inds.extend(candidates_in);
+        }
+
+        // Process Outside Budget
+        if !candidates_out.is_empty() && slots_available_outside > 0 {
+            candidates_out.shuffle(&mut rng);
+            // Truncate to available slots outside
+            if candidates_out.len() > slots_available_outside as usize {
+                candidates_out.truncate(slots_available_outside as usize);
+            }
+            split_inds.extend(candidates_out);
+        }
+
+        let refine_count = split_inds.len();
+        splats = self.refine_splats(&device, record, splats, split_inds, iter);
+
+        // Update current bounds based on the splats.
+        self.bounds = get_splat_bounds(splats.clone(), BOUND_PERCENTILE).await;
+        client.memory_cleanup();
+
+        (
+            splats.clone(),
+            RefineStats {
+                num_added: refine_count as u32,
+                num_pruned: pruned_count,
+                total_splats: splats.num_splats(),
             },
         )
     }

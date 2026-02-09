@@ -20,7 +20,7 @@ members = [
     "crates/brush-wgsl",
     "crates/colmap-reader",
     "crates/lpips",
-    "crates/lpips-convert",
+    "crates/lpips-convert", "crates/object-capture-eval",
     "crates/rrfd",
 ]
 default-members = ["crates/brush-app"]

@@ -1,7 +1,7 @@
-use brush_render::{AlphaMode, bounding_box::BoundingBox, camera::Camera};
+use brush_render::{AlphaMode, bounding_box::{BoundingBox, BoundingSphere}, camera::Camera};
 use brush_vfs::BrushVfs;
 use burn::tensor::TensorData;
-use glam::{Affine3A, Vec3, vec3};
+use glam::{Affine3A, Mat3, Vec3, vec3};
 use image::{DynamicImage, GenericImageView};
 use std::{
     path::{Path, PathBuf},
@@ -168,6 +168,49 @@ impl Scene {
             },
         );
         BoundingBox::from_min_max(min, max)
+    }
+
+    // Computes the Bounding Sphere using the views in the Scene.
+    // The center of the sphere is computed as the point that minimizes
+    // the distance to all the camera Z axis.
+    // The radius is computed as the mean distance from all camera centers
+    // to the center.
+    pub fn get_bounding_sphere(&self) -> BoundingSphere {
+        let mut matrix_a = Mat3::ZERO;
+        let mut vector_b = Vec3::ZERO;
+        let identity = Mat3::IDENTITY;
+
+        for view in self.views.iter() {
+            let cam = &view.camera;
+            let camera_center = cam.position;
+            let v = (cam.rotation * Vec3::Z).normalize_or_zero();
+
+            let outer_product = Mat3::from_cols(v * v.x, v * v.y, v * v.z);
+            let projection_matrix_i = identity - outer_product;
+
+            matrix_a += projection_matrix_i;
+            vector_b += projection_matrix_i * camera_center;
+        }
+
+        if matrix_a.determinant().abs() < 1e-6 {
+            return BoundingSphere::from_center_and_radius(Vec3::ZERO, 0.)
+        }
+
+        let center = matrix_a.inverse() * vector_b;
+
+        let total_distance: f32 = self
+            .views
+            .iter()
+            .map(|view| view.camera.position.distance(center))
+            .sum();
+
+        let radius = if !self.views.is_empty() {
+            total_distance / self.views.len() as f32
+        } else {
+            0.0
+        };
+
+        BoundingSphere::from_center_and_radius(center, radius)
     }
 
     pub fn get_nearest_view(&self, reference: Affine3A) -> Option<usize> {

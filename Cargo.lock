@@ -258,6 +258,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "argh"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ff18325c8a36b82f992e533ece1ec9f9a9db446bd1c14d4f936bac88fcd240"
+dependencies = [
+ "argh_derive",
+ "argh_shared",
+ "rust-fuzzy-search",
+]
+
+[[package]]
+name = "argh_derive"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb7b2b83a50d329d5d8ccc620f5c7064028828538bdf5646acd60dc1f767803"
+dependencies = [
+ "argh_shared",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
+]
+
+[[package]]
+name = "argh_shared"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a464143cc82dedcdc3928737445362466b7674b5db4e2eb8e869846d6d84f4f6"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "array-init"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1142,6 +1174,7 @@ dependencies = [
  "burn",
  "burn-cubecl",
  "burn-wgpu",
+ "bytemuck",
  "clap",
  "glam",
  "log",
@@ -1268,6 +1301,8 @@ dependencies = [
  "brush-serde",
  "burn",
  "burn-cubecl",
+ "burn-fusion",
+ "burn-wgpu",
  "clap",
  "glam",
  "hashbrown 0.16.1",
@@ -6571,6 +6606,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "object-capture-eval"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "argh",
+ "brush-dataset",
+ "brush-process",
+ "brush-render",
+ "brush-train",
+ "brush-vfs",
+ "burn",
+ "burn-wgpu",
+ "env_logger",
+ "glam",
+ "image",
+ "tokio",
+ "tokio-stream",
+ "wgpu",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8484,6 +8540,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-fuzzy-search"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a157657054ffe556d8858504af8a672a054a6e0bd9e8ee531059100c0fa11bb2"
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9565,6 +9627,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
